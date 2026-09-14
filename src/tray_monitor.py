@@ -12,10 +12,8 @@ import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
 import urllib.request
 import urllib.error
-from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -588,6 +586,8 @@ class SettingsWindow:
 
     def _run_window(self):
         """在独立线程中运行 tkinter 窗口。"""
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk
         self.win = tk.Tk()
         self.win.title("托盘监控 - 设置")
         self.win.geometry("520x380")
@@ -676,7 +676,9 @@ class SettingsWindow:
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
         self.win.mainloop()
 
-    def _browse_file(self, var: tk.StringVar):
+    def _browse_file(self, var):
+        import tkinter as tk
+        from tkinter import filedialog
         path = filedialog.askopenfilename(
             title="选择可执行文件",
             filetypes=[("可执行文件", "*.exe;*.cmd;*.bat;*.ps1"), ("所有文件", "*.*")])
@@ -684,7 +686,9 @@ class SettingsWindow:
             var.set(path)
 
 
-    def _scan_syncthing(self, var: tk.StringVar):
+    def _scan_syncthing(self, var):
+        import tkinter as tk
+        from tkinter import messagebox
         """扫描常见路径查找 syncthing.exe，找到后弹出确认窗口。"""
         candidates = _find_syncthing_candidates()
 
@@ -700,7 +704,9 @@ class SettingsWindow:
         # 多个结果，弹出选择窗口
         self._show_scan_result(candidates, var)
 
-    def _show_scan_result(self, candidates: list[str], var: tk.StringVar):
+    def _show_scan_result(self, candidates, var):
+        import tkinter as tk
+        from tkinter import messagebox
         """弹出扫描结果选择窗口。"""
         win = tk.Toplevel(self.win)
         win.title("扫描结果 - 选择 Syncthing")
@@ -825,6 +831,7 @@ class ChangelogWindow:
         thread.start()
 
     def _run_window(self):
+        import tkinter as tk
         self.win = tk.Tk()
         self.win.title(f"更新说明 - 托盘监控 v{__version__}")
         self.win.geometry("560x480")
@@ -877,7 +884,7 @@ class ChangelogWindow:
                 return f"读取 CHANGELOG.md 失败: {e}"
         return "未找到 CHANGELOG.md 文件。"
 
-    def _apply_tags(self, text_widget: tk.Text):
+    def _apply_tags(self, text_widget):
         """给版本号标题和小节标题加样式。"""
         content = text_widget.get("1.0", "end")
         for match in re.finditer(r"^(## \[.+?\].*)$", content, re.MULTILINE):
