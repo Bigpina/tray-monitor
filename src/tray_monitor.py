@@ -233,9 +233,10 @@ def load_base_icon() -> Image.Image:
 ICON_BASE = load_base_icon()
 
 
-def build_status_icon(gw_ok: bool, st_ok: bool) -> Image.Image:
+def build_status_icon(gw_ok: bool, st_ok: bool, paused: bool = False) -> Image.Image:
     """根据状态在基础图标上绘制指示灯，最终输出适合托盘的尺寸。
     pystray 在 Windows 上可以处理 RGBA 图像，这里直接返回 RGBA。
+    paused=True 时显示灰色圆点表示暂停。
     """
     dr = COMPOSITE_DOT_RADIUS
     # 深色背景 + 虾合成
@@ -247,16 +248,21 @@ def build_status_icon(gw_ok: bool, st_ok: bool) -> Image.Image:
     bx = COMPOSITE_SIZE[0] - margin - dr
     gx = bx - dr * 2 - gap
 
-    if gw_ok:
-        draw.ellipse(
-            [gx - dr, cy - dr, gx + dr, cy + dr],
-            fill=COLOR_GREEN,
-        )
-    if st_ok:
-        draw.ellipse(
-            [bx - dr, cy - dr, bx + dr, cy + dr],
-            fill=COLOR_BLUE,
-        )
+    if paused:
+        # 暂停状态：两个灰色圆点
+        draw.ellipse([gx - dr, cy - dr, gx + dr, cy + dr], fill=COLOR_GRAY)
+        draw.ellipse([bx - dr, cy - dr, bx + dr, cy + dr], fill=COLOR_GRAY)
+    else:
+        if gw_ok:
+            draw.ellipse(
+                [gx - dr, cy - dr, gx + dr, cy + dr],
+                fill=COLOR_GREEN,
+            )
+        if st_ok:
+            draw.ellipse(
+                [bx - dr, cy - dr, bx + dr, cy + dr],
+                fill=COLOR_BLUE,
+            )
     # 缩小到托盘尺寸，转 RGB
     return bg.resize(TRAY_ICON_SIZE, Image.Resampling.LANCZOS)
 
@@ -496,10 +502,16 @@ class MonitorState:
     """跟踪各服务的监控状态。"""
 
     def __init__(self):
+        self.paused = False
         self.gateway_fails = 0
         self.syncthing_fails = 0
         self.gateway_cooldown_until = 0.0
         self.syncthing_cooldown_until = 0.0
+
+    def toggle_pause(self):
+        """切换暂停状态。"""
+        self.paused = not self.paused
+        return self.paused
 
     def gateway_check(self) -> str:
         now = time.time()
@@ -894,14 +906,19 @@ class TrayMonitor:
             time.sleep(1)
 
     def _pick_icon(self, gw: str, st: str) -> Image.Image:
+        if self.state.paused:
+            return build_status_icon(False, False, paused=True)
         gw_ok = (gw == "ok")
         st_ok = (st == "ok")
         return build_status_icon(gw_ok, st_ok)
 
     def _update_icon(self, gw: str, st: str):
-        gw_label = {"ok": "正常", "restart": "重启中", "cooldown": "冷却中"}.get(gw, gw)
-        st_label = {"ok": "正常", "restart": "重启中", "cooldown": "冷却中"}.get(st, st)
-        line1 = f"Gateway: {gw_label} | Syncthing: {st_label}"
+        if self.state.paused:
+            line1 = "⏸ 监控已暂停"
+        else:
+            gw_label = {"ok": "正常", "restart": "重启中", "cooldown": "冷却中"}.get(gw, gw)
+            st_label = {"ok": "正常", "restart": "重启中", "cooldown": "冷却中"}.get(st, st)
+            line1 = f"Gateway: {gw_label} | Syncthing: {st_label}"
         line2 = _format_agents_line(self._agents)
         self._status_text = line1 + ("\n" + line2 if line2 else "")
         if self.icon:
@@ -918,6 +935,12 @@ class TrayMonitor:
         """后台监控线程。"""
         RESTART_WAIT = 60  # 重启后等待秒数
         while self._running:
+            # 暂停时跳过检测，只刷新图标
+            if self.state.paused:
+                self._update_icon("paused", "paused")
+                self._interruptible_sleep(CONFIG["check_interval"])
+                continue
+
             gw = self.state.gateway_check()
             st = self.state.syncthing_check()
 
@@ -959,6 +982,15 @@ class TrayMonitor:
             self._changelog_window = ChangelogWindow()
         self._changelog_window.show()
 
+    def _menu_toggle_pause(self, icon, item):
+        """切换暂停/恢复监控。"""
+        is_paused = self.state.toggle_pause()
+        if is_paused:
+            log.info("用户暂停监控")
+            self._update_icon("paused", "paused")
+        else:
+            log.info("用户恢复监控")
+
     def _menu_exit(self, icon, item):
         """退出程序。"""
         log.info("用户退出")
@@ -972,6 +1004,8 @@ class TrayMonitor:
         return pystray.Menu(
             pystray.MenuItem(lambda item: self._status_text, self._menu_status, default=True),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: "恢复监控" if self.state.paused else "暂停监控",
+                             self._menu_toggle_pause),
             pystray.MenuItem("设置", self._menu_settings),
             pystray.MenuItem(f"更新说明 (v{__version__})", self._menu_changelog),
             pystray.Menu.SEPARATOR,
