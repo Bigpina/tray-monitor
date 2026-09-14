@@ -343,8 +343,10 @@ def _check_gateway_via_http() -> bool | None:
 
 
 def _check_gateway_via_process() -> bool:
-    """扫描 node 进程的命令行，检查是否包含 openclaw gateway run（实际监听进程）。
-    注意：使用 token 匹配，排除 gateway restart/status 等子命令，只匹配实际运行的 Gateway。
+    """扫描 node 进程的命令行，检查是否包含 openclaw gateway 监听进程。
+    支持两种启动方式：
+    - gateway run（手动/旧方式）
+    - gateway --port（服务方式，由 Task Scheduler 启动）
     """
     for proc in psutil.process_iter(["name", "pid"]):
         try:
@@ -352,12 +354,12 @@ def _check_gateway_via_process() -> bool:
             if "node" not in name:
                 continue
             cmdline_parts = [p.lower() for p in proc.cmdline()]
-            # 匹配 gateway 监听进程（gateway run 或 gateway start），排除 restart/status 等子命令
-            # 必须包含 "openclaw" 和 "gateway"，且 "run" 或 "start" 作为独立 token 出现
             has_openclaw = any("openclaw" in p for p in cmdline_parts)
             has_gateway = any(p == "gateway" for p in cmdline_parts)
+            # 匹配 gateway run（手动）或 gateway + --port（服务）
             has_run = any(p == "run" for p in cmdline_parts)
-            if has_openclaw and has_gateway and has_run:
+            has_port = any(p.startswith("--port") for p in cmdline_parts)
+            if has_openclaw and has_gateway and (has_run or has_port):
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
@@ -481,17 +483,31 @@ def start_syncthing() -> bool:
 
 
 def restart_gateway() -> bool:
-    """直接运行 gateway run（无窗口）。使用 node + openclaw 入口，与 .openclaw/gateway.cmd 同路径。"""
+    """通过官方推荐方式管理 Gateway 服务。
+    - 已运行时：gateway restart（安全排空后重启）
+    - 未运行时：gateway start（启动服务）
+    """
     cmd = _get_openclaw_cmd()
+    # 先判断 Gateway 是否在运行，决定用 start 还是 restart
+    running = _check_gateway_via_http() or _check_gateway_via_process()
+    subcmd = "restart" if running else "start"
     try:
-        subprocess.Popen(
-            cmd + ["gateway", "run"],
+        result = subprocess.run(
+            cmd + ["gateway", subcmd],
+            capture_output=True, text=True, timeout=30,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        log.info("已发送 Gateway 启动命令: %s", " ".join(cmd + ["gateway", "run"]))
-        return True
+        if result.returncode == 0:
+            log.info("Gateway %s 成功", subcmd)
+            return True
+        else:
+            log.error("Gateway %s 失败 (exit=%d): %s", subcmd, result.returncode, result.stderr.strip())
+            return False
+    except subprocess.TimeoutExpired:
+        log.error("Gateway %s 超时", subcmd)
+        return False
     except Exception as e:
-        log.error("Gateway 重启失败: %s", e)
+        log.error("Gateway %s 异常: %s", subcmd, e)
         return False
 
 # ---------------------------------------------------------------------------
