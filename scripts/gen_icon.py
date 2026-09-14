@@ -45,10 +45,10 @@ def create_lobster(size):
 
 # Generate 64x64 PNG (pystray will handle sizing)
 icon = create_lobster(64)
-icon.save(r"D:\openclaw\alpha\tray-monitor\icons\lobster.png")
+icon.save(r"icons\lobster.png")
 
 # Generate ICO with Pillow's auto-resize
-icon.save(r"D:\openclaw\alpha\tray-monitor\icons\lobster.ico", format='ICO',
+icon.save(r"icons\lobster.ico", format='ICO',
            sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
 
 print("Done - 64x64 source, auto-resized ICO")

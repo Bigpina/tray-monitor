@@ -2,41 +2,36 @@
 
 监控 OpenClaw Gateway 和 Syncthing 运行状态的 Windows 托盘程序。异常时自动重启，纯后台运行，无主窗口。
 
-## 新功能（v4）
-
-- 📋 **更新说明**：右键菜单 → 更新说明，查看各版本变更历史
-- 🔢 **版本管理**：语义化版本号（SemVer），代码内 `__version__` + `CHANGELOG.md`
-
-## 历史功能（v3）
-
-- ⚙️ **设置窗口**：右键菜单 → 设置，可视化修改所有配置
-- 🚀 **双击启动**：`start.vbs` 无窗口启动，`start.bat` 带控制台调试
-- 🔧 **直接调用**：不再依赖 VBS 脚本，Python 直接调用 exe/命令
-- 🔥 **热更新**：保存配置后立即生效，无需重启
-
 ## 功能
 
 - 🟢 **绿灯**：Gateway 正常
 - 🔵 **蓝灯**：Syncthing 正常
 - 🔴 **两灯都不亮**：均异常
 - ⚪ **冷却中**：连续失败后暂停重启
-- 🔄 **自动重启**：检测到进程退出后自动拉起
+- ⏸ **暂停监控**：手动暂停检测和重启
+- 🔄 **自动重启**：检测到进程退出后自动拉起（通过系统服务）
 - 🛡️ **失败保护**：连续失败 N 次后冷却，避免无限重启
+- 📋 **更新说明**：右键菜单查看版本变更历史
 
 ## 文件结构
 
 ```
 tray-monitor/
+├── src/
+│   └── tray_monitor.py          # 主程序
 ├── icons/
 │   ├── lobster.ico              # 托盘图标
 │   └── lobster.png
-├── src/
-│   └── tray_monitor.py          # 主程序
-├── config.json                  # 配置文件（可通过设置窗口修改）
+├── scripts/
+│   └── gen_icon.py              # 图标生成脚本（开发用）
+├── config.example.json          # 配置模板（首次使用复制为 config.json）
+├── CHANGELOG.md                 # 版本变更日志
+├── check_version.py             # 版本管理检查工具
+├── build.bat                    # 一键构建脚本
 ├── start.vbs                    # 双击无窗口启动
 ├── start.bat                    # 双击带控制台启动（调试用）
-├── requirements.txt             # Python 依赖
 ├── setup.bat                    # 一键安装依赖
+├── requirements.txt             # Python 依赖
 └── README.md
 ```
 
@@ -44,7 +39,7 @@ tray-monitor/
 
 ### 前置条件
 
-- Python 3.8+
+- Python 3.8+（需在 PATH 中）
 - pip
 
 ### 一键安装
@@ -54,6 +49,27 @@ tray-monitor/
 ```bash
 pip install -r requirements.txt
 ```
+
+## 配置
+
+首次使用，复制配置模板并按需修改：
+
+```bash
+copy config.example.json config.json
+```
+
+或直接启动程序后，通过右键菜单 → **设置** 进行可视化配置。
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| Syncthing 可执行文件 | syncthing.exe 的完整路径 | 自动扫描 |
+| OpenClaw 命令路径 | openclaw 命令或完整路径 | `openclaw` |
+| 检测间隔（秒） | 多久检查一次服务状态 | `10` |
+| 失败次数上限 | 连续失败几次后进入冷却 | `3` |
+| 冷却时长（秒） | 冷却期持续多久 | `120` |
+| 日志级别 | DEBUG / INFO / WARNING / ERROR | `INFO` |
+| Gateway URL | Gateway HTTP 地址 | `http://127.0.0.1:18789` |
+| Gateway Token 文件 | openclaw.json 路径 | 自动检测 |
 
 ## 启动
 
@@ -71,57 +87,37 @@ pip install -r requirements.txt
 python src\tray_monitor.py
 ```
 
-## 配置
+## 托盘菜单
 
-### 通过设置窗口（推荐）
+右键托盘图标：
 
-右键托盘图标 → **设置**，可修改：
+- **状态信息**：显示 Gateway / Syncthing / Agent 状态
+- **暂停监控 / 恢复监控**：手动暂停/恢复自动检测
+- **设置**：可视化修改配置（保存后立即生效）
+- **更新说明 (v4.x.x)**：查看版本变更历史
+- **退出**
 
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| Syncthing 可执行文件 | syncthing.exe 的完整路径 | `D:\APP\syncthing-windows-amd64-v2.1.0\syncthing.exe` |
-| OpenClaw 命令路径 | openclaw 命令或完整路径 | `openclaw` |
-| Node.js 路径 | node.exe 完整路径（优先于 openclaw_cmd） | 自动检测 |
-| OpenClaw mjs 路径 | openclaw.mjs 完整路径 | 自动检测 |
-| 检测间隔（秒） | 多久检查一次服务状态 | `5` |
-| 失败次数上限 | 连续失败几次后进入冷却 | `3` |
-| 冷却时长（秒） | 冷却期持续多久 | `60` |
-| 日志级别 | DEBUG / INFO / WARNING / ERROR | `INFO` |
-| Gateway URL | Gateway HTTP 地址 | `http://127.0.0.1:18789` |
-| Gateway Token 文件 | openclaw.json 路径，用于读取认证 token | `~/.openclaw/openclaw.json` |
+## 构建 exe
 
-**保存后立即生效，无需重启程序。**
-
-### 手动编辑 config.json
-
-```json
-{
-  "syncthing_exe": "D:\\APP\\syncthing-windows-amd64-v2.1.0\\syncthing.exe",
-  "openclaw_cmd": "openclaw",
-  "node_exe": "C:\\Users\\...\\node.exe",
-  "openclaw_mjs": "C:\\Users\\...\\openclaw.mjs",
-  "check_interval": 5,
-  "max_fail_count": 3,
-  "cooldown_seconds": 60,
-  "dot_radius": 16,
-  "log_level": "INFO",
-  "gateway_url": "http://127.0.0.1:18789",
-  "gateway_token_file": "C:\\Users\\...\\.openclaw\\openclaw.json"
-}
+```bash
+build.bat
 ```
 
-## 开机自启（可选）
+产物输出到 `release/v4.0.0/`，包含 exe、配置模板、文档。
 
-将 `start.vbs` 的快捷方式放入启动文件夹：
+## 版本管理
 
-```
-Win+R → shell:startup
+```bash
+python check_version.py    # 检查版本一致性
+git tag                    # 查看所有版本标签
+git log --oneline          # 查看提交历史
 ```
 
 ## 技术说明
 
-- **检测方式**：通过 `psutil` 遍历进程列表，匹配进程名
-- **重启方式**：Python 直接调用 subprocess（`CREATE_NO_WINDOW` 无窗口）
-- **图标**：基础图标 `lobster.ico` + 右下角状态圆点叠加
+- **Gateway 检测**：HTTP health 端点 → CLI 命令 → 进程扫描，三级降级
+- **Gateway 管理**：通过 `openclaw gateway start/restart` 管理系统服务
+- **Syncthing 检测**：`psutil` 遍历进程列表匹配进程名
+- **图标**：基础图标 + 右下角状态圆点叠加（绿/蓝/灰）
 - **线程模型**：主线程运行托盘事件循环，后台守护线程执行监控
 - **配置窗口**：tkinter（Python 内置），在独立线程中运行

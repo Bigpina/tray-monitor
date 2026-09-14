@@ -56,7 +56,11 @@ echo [2/2] 复制到 %RELEASE_DIR%...
 copy /y dist\tray_monitor.exe "%RELEASE_DIR%\tray_monitor.exe" >nul
 
 REM 复制配置文件和文档
-copy /y config.json "%RELEASE_DIR%\config.json" >nul
+if exist config.json (
+    copy /y config.json "%RELEASE_DIR%\config.json" >nul
+) else (
+    if exist config.example.json copy /y config.example.json "%RELEASE_DIR%\config.example.json" >nul
+)
 copy /y CHANGELOG.md "%RELEASE_DIR%\CHANGELOG.md" >nul
 copy /y README.md "%RELEASE_DIR%\README.md" >nul
 if exist start.vbs copy /y start.vbs "%RELEASE_DIR%\start.vbs" >nul
