@@ -1,0 +1,26 @@
+# 构建产物
+build/
+dist/
+release/
+*.exe
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 日志
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store

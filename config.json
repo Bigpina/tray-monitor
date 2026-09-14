@@ -1,0 +1,13 @@
+{
+  "syncthing_exe": "C:\\Program Files\\syncthing-windows-amd64-v2.1.2\\syncthing.exe",
+  "openclaw_cmd": "openclaw",
+  "node_exe": "",
+  "openclaw_mjs": "",
+  "check_interval": 10,
+  "max_fail_count": 3,
+  "cooldown_seconds": 120,
+  "dot_radius": 16,
+  "log_level": "INFO",
+  "gateway_url": "http://127.0.0.1:18789",
+  "gateway_token_file": "C:\\Users\\LiYuanbo\\.openclaw\\openclaw.json"
+}
