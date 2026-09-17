@@ -1,4 +1,4 @@
-﻿"""
+"""
 托盘监控程序
 监控 OpenClaw Gateway 和 Syncthing 运行状态，异常自动重启。
 纯托盘程序，无主窗口。双击 start.vbs 无窗口启动。
@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # 版本号
 # ---------------------------------------------------------------------------
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
 import psutil
 import pystray
@@ -193,6 +194,69 @@ log = logging.getLogger("tray-monitor")
 _auto_detect_syncthing()
 
 # ---------------------------------------------------------------------------
+# 共享 Tk UI 根
+# 在 pystray 旁边于临时线程里反复 tk.Tk() 容易在 Windows 上原生崩溃，
+# 且 pythonw 下看不到 traceback。改为进程内单一隐藏根 + 专用 UI 线程。
+# ---------------------------------------------------------------------------
+_ui_root = None
+_ui_root_ready = threading.Event()
+_ui_root_lock = threading.Lock()
+_icon_lock = threading.Lock()
+
+
+def get_ui_root():
+    """返回进程内唯一的隐藏 Tk 根（UI 线程上运行 mainloop）。"""
+    global _ui_root
+    with _ui_root_lock:
+        if _ui_root is not None:
+            try:
+                if _ui_root.winfo_exists():
+                    return _ui_root
+            except Exception:
+                pass
+            _ui_root = None
+            _ui_root_ready.clear()
+
+        def _ui_main():
+            global _ui_root
+            try:
+                import tkinter as tk
+                root = tk.Tk()
+                root.withdraw()
+                _ui_root = root
+                _ui_root_ready.set()
+                log.info("UI 线程 Tk 根已启动")
+                root.mainloop()
+            except Exception:
+                log.exception("UI 线程崩溃")
+                _ui_root_ready.set()
+
+        threading.Thread(target=_ui_main, daemon=True, name="tray-ui").start()
+        if not _ui_root_ready.wait(timeout=8):
+            log.error("UI 线程启动超时")
+            return None
+        return _ui_root
+
+
+def run_on_ui(fn, *args, **kwargs):
+    """把调用调度到 UI 线程执行；异常写入日志而不是让进程消失。"""
+    root = get_ui_root()
+    if root is None:
+        log.error("UI 根不可用，无法调度 %s", getattr(fn, "__name__", fn))
+        return
+
+    def _call():
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            log.exception("UI 回调异常: %s", getattr(fn, "__name__", fn))
+
+    try:
+        root.after(0, _call)
+    except Exception:
+        log.exception("调度到 UI 线程失败: %s", getattr(fn, "__name__", fn))
+
+# ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 CHECK_INTERVAL = CONFIG["check_interval"]
@@ -302,6 +366,29 @@ def _resolve_cmd(cmd: str) -> list[str]:
         return [found]
     # shutil.which 没找到，尝试直接用（让 subprocess 自己报错）
     return [cmd]
+
+
+def _describe_openclaw_cli(openclaw_cmd=None, node_exe=None, openclaw_mjs=None) -> tuple[bool, str]:
+    """返回 (是否解析成功, 设置窗展示文本)。参数为 None 时读 CONFIG。"""
+    oc = openclaw_cmd if openclaw_cmd is not None else CONFIG.get("openclaw_cmd", "openclaw")
+    oc = (oc or "openclaw").strip() or "openclaw"
+    node = node_exe if node_exe is not None else CONFIG.get("node_exe", "")
+    mjs = openclaw_mjs if openclaw_mjs is not None else CONFIG.get("openclaw_mjs", "")
+
+    if node and mjs and Path(node).exists() and Path(mjs).exists():
+        return True, f"{node} {mjs}\nnode 直调 · openclaw_cmd=「{oc}」"
+
+    resolved = _resolve_cmd(oc)
+    if len(resolved) >= 2 and resolved[0].lower() == "cmd":
+        path = resolved[-1]
+        if Path(path).exists():
+            return True, f"{path}\n经 cmd /c 调用 · openclaw_cmd=「{oc}」"
+        return False, f"未找到「{oc}」，请安装到 PATH 或手动指定"
+
+    path = resolved[0]
+    if Path(path).exists() or shutil.which(path):
+        return True, f"{path}\n经 PATH 解析 · openclaw_cmd=「{oc}」"
+    return False, f"未在 PATH 中找到「{oc}」，请安装或手动指定"
 
 
 def _check_gateway_via_cli() -> bool | None:
@@ -564,120 +651,252 @@ class MonitorState:
 # ---------------------------------------------------------------------------
 
 class SettingsWindow:
-    """tkinter 配置窗口。"""
+    """tkinter 配置窗口（分组布局 + OpenClaw CLI 自动探测）。"""
+
+    CLR_OK_BG = "#E8F6EE"
+    CLR_OK_FG = "#0F5C32"
+    CLR_WARN_BG = "#FEF3C7"
+    CLR_WARN_FG = "#854F0B"
+    CLR_CARD_BG = "#FFFFFF"
+    CLR_MUTED = "#616161"
+    CLR_ACCENT = "#C4281C"
+    FONT_UI = ("Microsoft YaHei UI", 9)
+    FONT_UI_BOLD = ("Microsoft YaHei UI", 9, "bold")
+    FONT_MONO = ("Consolas", 9)
+    FONT_GROUP = ("Microsoft YaHei UI", 8, "bold")
 
     def __init__(self, on_save_callback=None):
         self.on_save_callback = on_save_callback
         self.win = None
 
     def show(self):
-        """弹出设置窗口（在新线程中运行 tkinter）。"""
-        if self.win is not None:
-            # 窗口已打开，提到前台
-            try:
-                self.win.lift()
-                self.win.focus_force()
-            except Exception:
-                pass
+        def _open():
+            if self.win is not None:
+                try:
+                    if self.win.winfo_exists():
+                        self.win.deiconify()
+                        self.win.lift()
+                        self.win.focus_force()
+                        return
+                except Exception:
+                    pass
+                self.win = None
+            self._build_window()
+        run_on_ui(_open)
+
+    def _build_window(self):
+        import tkinter as tk
+        from tkinter import ttk
+
+        root = get_ui_root()
+        if root is None:
+            log.error("无法打开设置窗：UI 根不可用")
             return
 
-        thread = threading.Thread(target=self._run_window, daemon=True)
-        thread.start()
-
-    def _run_window(self):
-        """在独立线程中运行 tkinter 窗口。"""
-        import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk
-        self.win = tk.Tk()
-        self.win.title("托盘监控 - 设置")
-        self.win.geometry("520x380")
-        self.win.resizable(False, False)
-
-        # 让窗口居中
-        self.win.update_idletasks()
+        self.win = tk.Toplevel(root)
+        self.win.title(f"设置 · 托盘监控 v{__version__}")
+        self.win.geometry("560x640")
+        self.win.minsize(520, 560)
+        self.win.configure(bg="#F3F3F3")
 
         cfg = dict(CONFIG)
+        outer = ttk.Frame(self.win, padding=(12, 10, 12, 12))
+        outer.pack(fill="both", expand=True)
 
-        # --- Syncthing 路径 ---
-        row = 0
-        tk.Label(self.win, text="Syncthing 可执行文件:").grid(
-            row=row, column=0, sticky="w", padx=10, pady=(10, 2))
-        row += 1
-        frame_st = tk.Frame(self.win)
-        frame_st.grid(row=row, column=0, columnspan=3, sticky="ew", padx=10, pady=2)
-        frame_st.columnconfigure(0, weight=1)
+        # --- 顶部状态条 ---
+        status = ttk.LabelFrame(outer, text=" 当前状态 ", padding=8)
+        status.pack(fill="x", pady=(0, 10))
+        gw_ok = bool(_check_gateway_via_process())
+        st_ok = is_syncthing_running()
+        gw_txt = f"Gateway  {'正常' if gw_ok else '未检测到'}"
+        st_txt = f"Syncthing  {'正常' if st_ok else '未检测到'}"
+        ttk.Label(status, text=f"●  {gw_txt}", foreground="#1F9D55" if gw_ok else self.CLR_MUTED,
+                  font=self.FONT_UI).pack(side="left", padx=(0, 16))
+        ttk.Label(status, text=f"●  {st_txt}", foreground="#2B6CB0" if st_ok else self.CLR_MUTED,
+                  font=self.FONT_UI).pack(side="left")
+        ttk.Label(status, text=cfg.get("gateway_url", ""), foreground=self.CLR_MUTED,
+                  font=self.FONT_MONO).pack(side="right")
+
+        # --- 服务路径 ---
+        g_path = ttk.LabelFrame(outer, text=" 服务路径 ", padding=10)
+        g_path.pack(fill="x", pady=(0, 10))
+        g_path.columnconfigure(1, weight=1)
+
+        ttk.Label(g_path, text="Syncthing 可执行文件", font=self.FONT_UI,
+                  foreground=self.CLR_MUTED).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
         var_st = tk.StringVar(value=cfg.get("syncthing_exe", ""))
-        tk.Entry(frame_st, textvariable=var_st, width=50).grid(row=0, column=0, sticky="ew")
-        tk.Button(frame_st, text="浏览...", command=lambda: self._browse_file(var_st)).grid(
-            row=0, column=1, padx=(5, 0))
-        tk.Button(frame_st, text="扫描", command=lambda: self._scan_syncthing(var_st)).grid(
-            row=0, column=2, padx=(5, 0))
+        ent_st = ttk.Entry(g_path, textvariable=var_st, font=self.FONT_MONO)
+        ent_st.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 6))
+        st_btns = ttk.Frame(g_path)
+        st_btns.grid(row=1, column=2, sticky="e")
+        ttk.Button(st_btns, text="浏览", width=6,
+                   command=lambda: self._browse_file(var_st)).pack(side="left", padx=(0, 4))
+        ttk.Button(st_btns, text="扫描", width=6,
+                   command=lambda: self._scan_syncthing(var_st)).pack(side="left")
 
-        # --- OpenClaw 命令路径 ---
-        row += 1
-        tk.Label(self.win, text="OpenClaw 命令路径:").grid(
-            row=row, column=0, sticky="w", padx=10, pady=(10, 2))
-        row += 1
-        frame_oc = tk.Frame(self.win)
-        frame_oc.grid(row=row, column=0, columnspan=3, sticky="ew", padx=10, pady=2)
-        frame_oc.columnconfigure(0, weight=1)
-        var_oc = tk.StringVar(value=cfg.get("openclaw_cmd", "openclaw"))
-        tk.Entry(frame_oc, textvariable=var_oc, width=50).grid(row=0, column=0, sticky="ew")
-        tk.Button(frame_oc, text="浏览...", command=lambda: self._browse_file(var_oc)).grid(
-            row=0, column=1, padx=(5, 0))
+        ttk.Separator(g_path, orient="horizontal").grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=10)
 
-        # --- 检测间隔 ---
-        row += 1
-        tk.Label(self.win, text="检测间隔（秒）:").grid(
-            row=row, column=0, sticky="w", padx=10, pady=(10, 2))
-        var_interval = tk.StringVar(value=str(cfg.get("check_interval", 15)))
-        tk.Entry(self.win, textvariable=var_interval, width=10).grid(
-            row=row, column=1, sticky="w", padx=10, pady=(10, 2))
+        ttk.Label(g_path, text="OpenClaw CLI（自动探测）", font=self.FONT_UI,
+                  foreground=self.CLR_MUTED).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
-        # --- 失败次数上限 ---
-        row += 1
-        tk.Label(self.win, text="失败次数上限:").grid(
-            row=row, column=0, sticky="w", padx=10, pady=(10, 2))
+        # CLI 状态面板（找到 / 未找到 两种态）
+        self._cli_host = tk.Frame(g_path, bd=0, highlightthickness=0)
+        self._cli_host.grid(row=4, column=0, columnspan=3, sticky="ew")
+
+        # --- 监控策略 ---
+        g_mon = ttk.LabelFrame(outer, text=" 监控策略 ", padding=10)
+        g_mon.pack(fill="x", pady=(0, 10))
+        for i in range(3):
+            g_mon.columnconfigure(i, weight=1)
+
+        var_interval = tk.StringVar(value=str(cfg.get("check_interval", 10)))
         var_maxfail = tk.StringVar(value=str(cfg.get("max_fail_count", 3)))
-        tk.Entry(self.win, textvariable=var_maxfail, width=10).grid(
-            row=row, column=1, sticky="w", padx=10, pady=(10, 2))
+        var_cooldown = tk.StringVar(value=str(cfg.get("cooldown_seconds", 120)))
 
-        # --- 冷却时长 ---
-        row += 1
-        tk.Label(self.win, text="冷却时长（秒）:").grid(
-            row=row, column=0, sticky="w", padx=10, pady=(10, 2))
-        var_cooldown = tk.StringVar(value=str(cfg.get("cooldown_seconds", 300)))
-        tk.Entry(self.win, textvariable=var_cooldown, width=10).grid(
-            row=row, column=1, sticky="w", padx=10, pady=(10, 2))
+        for col, (label, var) in enumerate([
+            ("检测间隔（秒）", var_interval),
+            ("失败次数上限", var_maxfail),
+            ("冷却时长（秒）", var_cooldown),
+        ]):
+            cell = ttk.Frame(g_mon)
+            cell.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0))
+            ttk.Label(cell, text=label, font=self.FONT_UI,
+                      foreground=self.CLR_MUTED).pack(anchor="w", pady=(0, 4))
+            ttk.Entry(cell, textvariable=var, font=self.FONT_UI).pack(fill="x")
 
-        # --- 日志级别 ---
-        row += 1
-        tk.Label(self.win, text="日志级别:").grid(
-            row=row, column=0, sticky="w", padx=10, pady=(10, 2))
+        # --- 日志 ---
+        g_log = ttk.LabelFrame(outer, text=" 日志 ", padding=10)
+        g_log.pack(fill="x", pady=(0, 10))
+        ttk.Label(g_log, text="日志级别", font=self.FONT_UI,
+                  foreground=self.CLR_MUTED).pack(anchor="w", pady=(0, 4))
         var_loglevel = tk.StringVar(value=cfg.get("log_level", "INFO"))
-        combo = ttk.Combobox(self.win, textvariable=var_loglevel, values=[
-            "DEBUG", "INFO", "WARNING", "ERROR"], state="readonly", width=10)
-        combo.grid(row=row, column=1, sticky="w", padx=10, pady=(10, 2))
+        ttk.Combobox(g_log, textvariable=var_loglevel, state="readonly",
+                     values=["DEBUG", "INFO", "WARNING", "ERROR"], width=12,
+                     font=self.FONT_UI).pack(anchor="w")
 
-        # --- 按钮 ---
-        row += 1
-        btn_frame = tk.Frame(self.win)
-        btn_frame.grid(row=row, column=0, columnspan=3, pady=(20, 10))
+        # --- 高级（默认折叠）---
+        show_adv = tk.BooleanVar(value=False)
+        adv_wrap = ttk.Frame(outer)
+        adv_wrap.pack(fill="x", pady=(0, 10))
 
-        tk.Button(btn_frame, text="保存", width=10, command=lambda: self._save(
-            var_st, var_oc, var_interval, var_maxfail, var_cooldown, var_loglevel
-        )).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="取消", width=10, command=self._cancel).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="恢复默认", width=10, command=lambda: self._restore_defaults(
-            var_st, var_oc, var_interval, var_maxfail, var_cooldown, var_loglevel
-        )).pack(side="left", padx=5)
+        def _toggle_adv():
+            if show_adv.get():
+                adv_frame.pack(fill="x", pady=(6, 0))
+            else:
+                adv_frame.pack_forget()
 
-        # 关闭窗口时清理引用
+        ttk.Checkbutton(
+            adv_wrap, text="高级 · 命令解析覆盖",
+            variable=show_adv, command=_toggle_adv,
+            style="TCheckbutton",
+        ).pack(anchor="w")
+
+        adv_frame = ttk.LabelFrame(adv_wrap, text=" 一般无需修改 ", padding=10)
+        adv_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(adv_frame, text="留空 node / mjs 则走 PATH 自动探测；openclaw_cmd 为回退命令名。",
+                  font=self.FONT_UI, foreground=self.CLR_MUTED,
+                  wraplength=480, justify="left").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        var_node = tk.StringVar(value=cfg.get("node_exe", ""))
+        var_mjs = tk.StringVar(value=cfg.get("openclaw_mjs", ""))
+        var_oc = tk.StringVar(value=cfg.get("openclaw_cmd", "openclaw") or "openclaw")
+
+        def _add_adv_row(row, label, var, browse=False):
+            ttk.Label(adv_frame, text=label, font=self.FONT_UI).grid(
+                row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+            ent = ttk.Entry(adv_frame, textvariable=var, font=self.FONT_MONO)
+            ent.grid(row=row, column=1, sticky="ew", pady=3)
+            if browse:
+                ttk.Button(adv_frame, text="浏览", width=6,
+                           command=lambda: self._browse_file(var)).grid(
+                    row=row, column=2, padx=(6, 0), pady=3)
+
+        _add_adv_row(1, "node.exe", var_node, browse=True)
+        _add_adv_row(2, "openclaw.mjs", var_mjs, browse=True)
+        _add_adv_row(3, "openclaw_cmd", var_oc, browse=True)
+
+        # 供 CLI 面板刷新时读取未保存的高级值
+        self._adv_vars = {"oc": var_oc, "node": var_node, "mjs": var_mjs}
+        self._render_cli_panel()
+
+        # --- 底部按钮 ---
+        footer = ttk.Frame(outer)
+        footer.pack(fill="x", side="bottom")
+        ttk.Label(footer, text="保存后立即生效", font=self.FONT_UI,
+                  foreground=self.CLR_MUTED).pack(side="left")
+        btns = ttk.Frame(footer)
+        btns.pack(side="right")
+        ttk.Button(btns, text="恢复默认", width=10,
+                   command=lambda: self._restore_defaults(
+                       var_st, var_oc, var_node, var_mjs,
+                       var_interval, var_maxfail, var_cooldown, var_loglevel,
+                       self._render_cli_panel)).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="取消", width=8, command=self._cancel).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="保存", width=8,
+                   command=lambda: self._save(
+                       var_st, var_oc, var_node, var_mjs,
+                       var_interval, var_maxfail, var_cooldown, var_loglevel)).pack(side="left")
+
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.win.mainloop()
+        self.win.focus_force()
+
+    def _render_cli_panel(self):
+        """根据当前配置/高级输入重绘 OpenClaw CLI 探测面板。"""
+        import tkinter as tk
+
+        for child in self._cli_host.winfo_children():
+            child.destroy()
+
+        adv = getattr(self, "_adv_vars", None)
+        oc = adv["oc"].get() if adv else None
+        node = adv["node"].get() if adv else None
+        mjs = adv["mjs"].get() if adv else None
+        ok, text = _describe_openclaw_cli(
+            openclaw_cmd=oc or None,
+            node_exe=node or None,
+            openclaw_mjs=mjs or None,
+        )
+
+        bg = self.CLR_OK_BG if ok else self.CLR_WARN_BG
+        fg = self.CLR_OK_FG if ok else self.CLR_WARN_FG
+        panel = tk.Frame(self._cli_host, bg=bg, padx=10, pady=8)
+        panel.pack(fill="x")
+
+        head = "✓ 已自动解析" if ok else "! 未找到 CLI"
+        tk.Label(panel, text=head, bg=bg, fg=fg, font=self.FONT_UI_BOLD,
+                 anchor="w", justify="left").pack(anchor="w")
+        tk.Label(panel, text=text, bg=bg, fg="#1A1A1A", font=self.FONT_MONO,
+                 anchor="w", justify="left", wraplength=460).pack(anchor="w", pady=(4, 0))
+
+        actions = tk.Frame(panel, bg=bg)
+        actions.pack(anchor="e", pady=(6, 0))
+        tk.Button(
+            actions, text="重新检测", font=self.FONT_UI, relief="flat",
+            activebackground=bg, bg=bg, fg=fg, bd=0, cursor="hand2",
+            command=self._render_cli_panel,
+        ).pack(side="right")
+
+        if not ok:
+            manual = tk.Frame(panel, bg=bg)
+            manual.pack(fill="x", pady=(8, 0))
+            tk.Label(manual, text="手动指定", bg=bg, fg=fg, font=self.FONT_UI).pack(side="left")
+            var_manual = tk.StringVar(value="")
+            tk.Entry(manual, textvariable=var_manual, font=self.FONT_MONO).pack(
+                side="left", fill="x", expand=True, padx=6)
+
+            def _apply_manual():
+                val = var_manual.get().strip()
+                if not val:
+                    return
+                self._adv_vars["oc"].set(val)
+                self._render_cli_panel()
+
+            tk.Button(manual, text="应用", font=self.FONT_UI, command=_apply_manual).pack(side="left")
 
     def _browse_file(self, var):
-        import tkinter as tk
         from tkinter import filedialog
         path = filedialog.askopenfilename(
             title="选择可执行文件",
@@ -685,15 +904,14 @@ class SettingsWindow:
         if path:
             var.set(path)
 
-
     def _scan_syncthing(self, var):
-        import tkinter as tk
         from tkinter import messagebox
-        """扫描常见路径查找 syncthing.exe，找到后弹出确认窗口。"""
         candidates = _find_syncthing_candidates()
 
         if not candidates:
-            messagebox.showinfo("扫描结果", "未找到 syncthing.exe。\n请确认已安装 Syncthing，或使用「浏览」手动选择。")
+            messagebox.showinfo(
+                "扫描结果",
+                "未找到 syncthing.exe。\n请确认已安装 Syncthing，或使用「浏览」手动选择。")
             return
 
         if len(candidates) == 1:
@@ -701,13 +919,12 @@ class SettingsWindow:
                 var.set(candidates[0])
             return
 
-        # 多个结果，弹出选择窗口
         self._show_scan_result(candidates, var)
 
     def _show_scan_result(self, candidates, var):
         import tkinter as tk
         from tkinter import messagebox
-        """弹出扫描结果选择窗口。"""
+
         win = tk.Toplevel(self.win)
         win.title("扫描结果 - 选择 Syncthing")
         win.geometry("520x300")
@@ -718,7 +935,7 @@ class SettingsWindow:
         tk.Label(win, text=f"找到 {len(candidates)} 个 Syncthing，请选择：").pack(
             anchor="w", padx=10, pady=(10, 5))
 
-        listbox = tk.Listbox(win, height=8, font=("Consolas", 9))
+        listbox = tk.Listbox(win, height=8, font=self.FONT_MONO)
         listbox.pack(fill="both", expand=True, padx=10, pady=5)
         for p in candidates:
             listbox.insert(tk.END, p)
@@ -737,8 +954,9 @@ class SettingsWindow:
         tk.Button(btn_frame, text="确定", width=10, command=confirm).pack(side="left", padx=5)
         tk.Button(btn_frame, text="取消", width=10, command=win.destroy).pack(side="left", padx=5)
 
-    def _save(self, var_st, var_oc, var_interval, var_maxfail, var_cooldown, var_loglevel):
-        """验证并保存配置。"""
+    def _save(self, var_st, var_oc, var_node, var_mjs,
+              var_interval, var_maxfail, var_cooldown, var_loglevel):
+        from tkinter import messagebox
         try:
             interval = int(var_interval.get())
             maxfail = int(var_maxfail.get())
@@ -752,25 +970,21 @@ class SettingsWindow:
         new_cfg = {
             "syncthing_exe": var_st.get().strip(),
             "openclaw_cmd": var_oc.get().strip() or "openclaw",
-            "node_exe": CONFIG.get("node_exe", ""),
-            "openclaw_mjs": CONFIG.get("openclaw_mjs", ""),
+            "node_exe": var_node.get().strip(),
+            "openclaw_mjs": var_mjs.get().strip(),
             "check_interval": interval,
             "max_fail_count": maxfail,
             "cooldown_seconds": cooldown,
-            "dot_radius": CONFIG.get("dot_radius", 12),
+            "dot_radius": CONFIG.get("dot_radius", 16),
             "log_level": var_loglevel.get(),
             "gateway_url": CONFIG.get("gateway_url", ""),
             "gateway_token_file": CONFIG.get("gateway_token_file", ""),
         }
 
-        # 保存到文件
         save_config(new_cfg)
-
-        # 热更新运行时配置
         CONFIG.clear()
         CONFIG.update(new_cfg)
 
-        # 更新模块级变量
         global CHECK_INTERVAL, MAX_FAIL_COUNT, COOLDOWN_SECONDS, DOT_RADIUS, COMPOSITE_DOT_RADIUS
         CHECK_INTERVAL = interval
         MAX_FAIL_COUNT = maxfail
@@ -778,7 +992,6 @@ class SettingsWindow:
         DOT_RADIUS = new_cfg.get("dot_radius", 16)
         COMPOSITE_DOT_RADIUS = new_cfg.get("dot_radius", 16)
 
-        # 更新日志级别
         logging.getLogger("tray-monitor").setLevel(
             getattr(logging, new_cfg["log_level"].upper(), logging.INFO))
 
@@ -792,118 +1005,223 @@ class SettingsWindow:
     def _cancel(self):
         self._close()
 
-    def _restore_defaults(self, var_st, var_oc, var_interval, var_maxfail, var_cooldown, var_loglevel):
+    def _restore_defaults(self, var_st, var_oc, var_node, var_mjs,
+                          var_interval, var_maxfail, var_cooldown, var_loglevel,
+                          refresh_cli=None):
         var_st.set(DEFAULT_CONFIG["syncthing_exe"])
         var_oc.set(DEFAULT_CONFIG["openclaw_cmd"])
+        var_node.set(DEFAULT_CONFIG.get("node_exe", ""))
+        var_mjs.set(DEFAULT_CONFIG.get("openclaw_mjs", ""))
         var_interval.set(str(DEFAULT_CONFIG["check_interval"]))
         var_maxfail.set(str(DEFAULT_CONFIG["max_fail_count"]))
         var_cooldown.set(str(DEFAULT_CONFIG["cooldown_seconds"]))
         var_loglevel.set(DEFAULT_CONFIG["log_level"])
+        if refresh_cli:
+            refresh_cli()
 
     def _close(self):
-        if self.win is not None:
+        win, self.win = self.win, None
+        if win is not None:
             try:
-                self.win.quit()
-                self.win.destroy()
+                win.destroy()
             except Exception:
                 pass
-            self.win = None
 
 # ---------------------------------------------------------------------------
 # 更新说明窗口
 # ---------------------------------------------------------------------------
 
 class ChangelogWindow:
-    """显示版本更新说明的窗口。"""
+    """显示版本更新说明的窗口（Markdown 子集渲染）。"""
+
+    CLR_BG = "#F3F3F3"
+    CLR_CARD = "#FFFFFF"
+    CLR_INK = "#1A1A1A"
+    CLR_MUTED = "#616161"
+    CLR_ACCENT = "#C4281C"
+    CLR_ACCENT_SOFT = "#FCEBEA"
+    CLR_LINE = "#E0E0E0"
+    FONT_TITLE = ("Microsoft YaHei UI", 13, "bold")
+    FONT_SUB = ("Microsoft YaHei UI", 9)
+    FONT_BODY = ("Microsoft YaHei UI", 9)
+    FONT_MONO = ("Consolas", 9)
+    FONT_VER = ("Microsoft YaHei UI", 11, "bold")
+    FONT_SEC = ("Microsoft YaHei UI", 9, "bold")
 
     def __init__(self):
         self.win = None
 
     def show(self):
-        if self.win is not None:
-            try:
-                self.win.lift()
-                self.win.focus_force()
-            except Exception:
-                pass
-            return
-        thread = threading.Thread(target=self._run_window, daemon=True)
-        thread.start()
+        def _open():
+            if self.win is not None:
+                try:
+                    if self.win.winfo_exists():
+                        self.win.deiconify()
+                        self.win.lift()
+                        self.win.focus_force()
+                        return
+                except Exception:
+                    pass
+                self.win = None
+            self._build_window()
+        run_on_ui(_open)
 
-    def _run_window(self):
+    def _build_window(self):
         import tkinter as tk
-        self.win = tk.Tk()
-        self.win.title(f"更新说明 - 托盘监控 v{__version__}")
-        self.win.geometry("560x480")
-        self.win.resizable(True, True)
-        self.win.minsize(400, 300)
+        from tkinter import ttk
 
-        # 顶部版本信息
-        header = tk.Frame(self.win)
-        header.pack(fill="x", padx=10, pady=(10, 5))
-        tk.Label(header, text=f"托盘监控 v{__version__}",
-                 font=("Microsoft YaHei", 14, "bold")).pack(side="left")
+        root = get_ui_root()
+        if root is None:
+            log.error("无法打开更新说明：UI 根不可用")
+            return
 
-        # 文本区域
-        text_frame = tk.Frame(self.win)
-        text_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.win = tk.Toplevel(root)
+        self.win.title(f"更新说明 · 托盘监控 v{__version__}")
+        self.win.geometry("580x520")
+        self.win.minsize(420, 360)
+        self.win.configure(bg=self.CLR_BG)
 
-        scrollbar = tk.Scrollbar(text_frame)
-        scrollbar.pack(side="right", fill="y")
+        outer = ttk.Frame(self.win, padding=(12, 10, 12, 12))
+        outer.pack(fill="both", expand=True)
 
-        text_widget = tk.Text(text_frame, wrap="word", font=("Consolas", 10),
-                              yscrollcommand=scrollbar.set, state="disabled",
-                              bg="#fafafa", padx=8, pady=8)
-        text_widget.pack(fill="both", expand=True)
-        scrollbar.config(command=text_widget.yview)
+        # --- 头部 ---
+        header = tk.Frame(outer, bg=self.CLR_CARD, padx=12, pady=12)
+        header.pack(fill="x", pady=(0, 10))
 
-        # 加载并渲染 CHANGELOG.md
-        content = self._load_changelog()
-        text_widget.config(state="normal")
-        text_widget.insert("1.0", content)
-        # 简单样式：版本号加粗
-        text_widget.tag_configure("version", font=("Consolas", 11, "bold"))
-        text_widget.tag_configure("section", font=("Consolas", 10, "bold"))
-        self._apply_tags(text_widget)
-        text_widget.config(state="disabled")
+        left = tk.Frame(header, bg=self.CLR_CARD)
+        left.pack(side="left", fill="x", expand=True)
+        tk.Label(left, text=f"托盘监控 v{__version__}", bg=self.CLR_CARD, fg=self.CLR_INK,
+                 font=self.FONT_TITLE, anchor="w").pack(anchor="w")
+        tk.Label(left, text="版本变更历史 · 格式基于 Keep a Changelog", bg=self.CLR_CARD,
+                 fg=self.CLR_MUTED, font=self.FONT_SUB, anchor="w").pack(anchor="w", pady=(4, 0))
 
-        # 关闭按钮
-        btn_frame = tk.Frame(self.win)
-        btn_frame.pack(pady=(0, 10))
-        tk.Button(btn_frame, text="关闭", width=10,
-                  command=self._close).pack()
+        badge = tk.Label(header, text="当前版本", bg=self.CLR_ACCENT_SOFT, fg=self.CLR_ACCENT,
+                         font=self.FONT_SUB, padx=8, pady=3)
+        badge.pack(side="right", anchor="n")
+
+        # --- 正文 ---
+        body = tk.Frame(outer, bg=self.CLR_CARD)
+        body.pack(fill="both", expand=True)
+
+        scroll = ttk.Scrollbar(body)
+        scroll.pack(side="right", fill="y")
+
+        text = tk.Text(
+            body, wrap="word", relief="flat", bd=0,
+            font=self.FONT_BODY, fg=self.CLR_INK, bg=self.CLR_CARD,
+            padx=14, pady=12, spacing1=2, spacing3=4,
+            yscrollcommand=scroll.set, state="disabled",
+            cursor="arrow",
+        )
+        text.pack(side="left", fill="both", expand=True)
+        scroll.config(command=text.yview)
+
+        self._configure_tags(text)
+        self._render_markdown(text, self._load_changelog())
+        text.config(state="disabled")
+
+        # --- 底部 ---
+        footer = ttk.Frame(outer)
+        footer.pack(fill="x", pady=(10, 0))
+        ttk.Label(footer, text=f"文件：{CHANGELOG_PATH.name}", font=self.FONT_SUB,
+                  foreground=self.CLR_MUTED).pack(side="left")
+        ttk.Button(footer, text="关闭", width=8, command=self._close).pack(side="right")
 
         self.win.protocol("WM_DELETE_WINDOW", self._close)
-        self.win.mainloop()
+        self.win.focus_force()
+
+    def _configure_tags(self, text):
+        text.tag_configure("h1", font=self.FONT_TITLE, foreground=self.CLR_INK,
+                           spacing1=8, spacing3=6)
+        text.tag_configure("intro", font=self.FONT_SUB, foreground=self.CLR_MUTED,
+                           spacing3=10, lmargin1=0, lmargin2=0)
+        text.tag_configure("version", font=self.FONT_VER, foreground=self.CLR_ACCENT,
+                           background=self.CLR_ACCENT_SOFT,
+                           spacing1=12, spacing3=6,
+                           lmargin1=8, lmargin2=8, rmargin=8)
+        text.tag_configure("section", font=self.FONT_SEC, foreground=self.CLR_INK,
+                           spacing1=10, spacing3=4)
+        text.tag_configure("bullet", font=self.FONT_BODY, foreground=self.CLR_INK,
+                           lmargin1=18, lmargin2=32, spacing3=3)
+        text.tag_configure("bold", font=("Microsoft YaHei UI", 9, "bold"))
+        text.tag_configure("code", font=self.FONT_MONO, background="#F0F0F0")
+        text.tag_configure("hr", font=self.FONT_SUB, foreground=self.CLR_LINE,
+                           spacing1=8, spacing3=8)
 
     def _load_changelog(self) -> str:
         if CHANGELOG_PATH.exists():
             try:
                 return CHANGELOG_PATH.read_text(encoding="utf-8")
             except Exception as e:
-                return f"读取 CHANGELOG.md 失败: {e}"
-        return "未找到 CHANGELOG.md 文件。"
+                return f"# 读取失败\n\n读取 CHANGELOG.md 失败: {e}"
+        return "# 未找到\n\n未找到 CHANGELOG.md 文件。"
 
-    def _apply_tags(self, text_widget):
-        """给版本号标题和小节标题加样式。"""
-        content = text_widget.get("1.0", "end")
-        for match in re.finditer(r"^(## \[.+?\].*)$", content, re.MULTILINE):
-            start_idx = f"1.0+{match.start()}c"
-            end_idx = f"1.0+{match.end()}c"
-            text_widget.tag_add("version", start_idx, end_idx)
-        for match in re.finditer(r"^(### .+)$", content, re.MULTILINE):
-            start_idx = f"1.0+{match.start()}c"
-            end_idx = f"1.0+{match.end()}c"
-            text_widget.tag_add("section", start_idx, end_idx)
+    def _render_markdown(self, text, content: str):
+        """渲染 Markdown 子集：H1 / 版本标题 / 小节 / 列表 / 粗体 / 行内代码。"""
+        text.config(state="normal")
+        text.delete("1.0", "end")
+
+        lines = content.splitlines()
+        i = 0
+        seen_version = False
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            if not stripped:
+                i += 1
+                continue
+
+            if stripped.startswith("# "):
+                text.insert("end", stripped[2:].strip() + "\n", "h1")
+            elif stripped.startswith("## [") or stripped.startswith("## "):
+                title = stripped[2:].strip()
+                text.insert("end", f"\n  {title}\n", "version")
+                seen_version = True
+            elif stripped.startswith("### "):
+                text.insert("end", stripped[4:].strip() + "\n", "section")
+            elif stripped.startswith("---"):
+                text.insert("end", "— — —\n", "hr")
+            elif stripped.startswith("- ") or stripped.startswith("* "):
+                self._insert_rich_bullet(text, stripped[2:].strip())
+            else:
+                # 引言/说明段：版本区之前用 muted，之后用正文
+                tag = "intro" if not seen_version else "bullet"
+                self._insert_rich_line(text, stripped, base_tag=tag)
+                text.insert("end", "\n", tag)
+            i += 1
+
+        text.insert("end", "\n")
+
+    def _insert_rich_line(self, text, line: str, base_tag: str = "bullet"):
+        """插入一行，解析 **粗体** 与 `代码`。"""
+        # 按 ** 和 ` 切分
+        pattern = re.compile(r"(\*\*.+?\*\*|`[^`]+`)")
+        pos = 0
+        for m in pattern.finditer(line):
+            if m.start() > pos:
+                text.insert("end", line[pos:m.start()], base_tag)
+            token = m.group(0)
+            if token.startswith("**") and token.endswith("**"):
+                text.insert("end", token[2:-2], (base_tag, "bold"))
+            elif token.startswith("`") and token.endswith("`"):
+                text.insert("end", token[1:-1], (base_tag, "code"))
+            pos = m.end()
+        if pos < len(line):
+            text.insert("end", line[pos:], base_tag)
+
+    def _insert_rich_bullet(self, text, body: str):
+        text.insert("end", "•  ", "bullet")
+        self._insert_rich_line(text, body, base_tag="bullet")
+        text.insert("end", "\n", "bullet")
 
     def _close(self):
-        if self.win is not None:
+        win, self.win = self.win, None
+        if win is not None:
             try:
-                self.win.quit()
-                self.win.destroy()
+                win.destroy()
             except Exception:
                 pass
-            self.win = None
 
 # ---------------------------------------------------------------------------
 # 托盘程序主逻辑
@@ -944,13 +1262,15 @@ class TrayMonitor:
             line1 = f"Gateway: {gw_label} | Syncthing: {st_label}"
         line2 = _format_agents_line(self._agents)
         self._status_text = line1 + ("\n" + line2 if line2 else "")
-        if self.icon:
-            self.icon.icon = self._pick_icon(gw, st)
-            self.icon.title = self._status_text
+        if not self.icon:
+            return
+        with _icon_lock:
             try:
+                self.icon.icon = self._pick_icon(gw, st)
+                self.icon.title = self._status_text
                 self.icon.update_menu()
             except Exception:
-                pass
+                log.exception("更新托盘图标/菜单失败")
 
     # --- 监控循环 ---
 
@@ -958,34 +1278,38 @@ class TrayMonitor:
         """后台监控线程。"""
         RESTART_WAIT = 60  # 重启后等待秒数
         while self._running:
-            # 暂停时跳过检测，只刷新图标
-            if self.state.paused:
-                self._update_icon("paused", "paused")
-                self._interruptible_sleep(CONFIG["check_interval"])
-                continue
+            try:
+                # 暂停时跳过检测，只刷新图标
+                if self.state.paused:
+                    self._update_icon("paused", "paused")
+                    self._interruptible_sleep(CONFIG["check_interval"])
+                    continue
 
-            gw = self.state.gateway_check()
-            st = self.state.syncthing_check()
+                gw = self.state.gateway_check()
+                st = self.state.syncthing_check()
 
-            restart_happened = False
+                restart_happened = False
 
-            if gw == "restart":
-                log.info("Gateway 未运行，尝试重启...")
-                restart_gateway()
-                restart_happened = True
+                if gw == "restart":
+                    log.info("Gateway 未运行，尝试重启...")
+                    restart_gateway()
+                    restart_happened = True
 
-            if st == "restart":
-                log.info("Syncthing 未运行，尝试启动...")
-                start_syncthing()
-                restart_happened = True
+                if st == "restart":
+                    log.info("Syncthing 未运行，尝试启动...")
+                    start_syncthing()
+                    restart_happened = True
 
-            self._update_icon(gw, st)
+                self._update_icon(gw, st)
 
-            if restart_happened:
-                log.info("重启已发送，等待 %ds 后再检测...", RESTART_WAIT)
-                self._interruptible_sleep(RESTART_WAIT)
-            else:
-                self._interruptible_sleep(CONFIG["check_interval"])
+                if restart_happened:
+                    log.info("重启已发送，等待 %ds 后再检测...", RESTART_WAIT)
+                    self._interruptible_sleep(RESTART_WAIT)
+                else:
+                    self._interruptible_sleep(CONFIG["check_interval"])
+            except Exception:
+                log.exception("监控循环异常，稍后重试")
+                self._interruptible_sleep(max(5, int(CONFIG.get("check_interval", 10))))
 
     # --- 菜单 ---
 
@@ -995,15 +1319,21 @@ class TrayMonitor:
 
     def _menu_settings(self, icon, item):
         """打开设置窗口。"""
-        if self._settings_window is None:
-            self._settings_window = SettingsWindow()
-        self._settings_window.show()
+        try:
+            if self._settings_window is None:
+                self._settings_window = SettingsWindow()
+            self._settings_window.show()
+        except Exception:
+            log.exception("打开设置窗失败")
 
     def _menu_changelog(self, icon, item):
         """打开更新说明窗口。"""
-        if self._changelog_window is None:
-            self._changelog_window = ChangelogWindow()
-        self._changelog_window.show()
+        try:
+            if self._changelog_window is None:
+                self._changelog_window = ChangelogWindow()
+            self._changelog_window.show()
+        except Exception:
+            log.exception("打开更新说明失败")
 
     def _menu_toggle_pause(self, icon, item):
         """切换暂停/恢复监控。"""
@@ -1013,6 +1343,14 @@ class TrayMonitor:
             self._update_icon("paused", "paused")
         else:
             log.info("用户恢复监控")
+            # 立刻做一次检测并刷新图标，避免恢复后长时间灰点
+            try:
+                gw = self.state.gateway_check()
+                st = self.state.syncthing_check()
+                self._update_icon(gw, st)
+            except Exception:
+                log.exception("恢复监控后刷新状态失败")
+                self._update_icon("restart", "restart")
 
     def _menu_exit(self, icon, item):
         """退出程序。"""
@@ -1040,8 +1378,11 @@ class TrayMonitor:
     def _agent_refresh_loop(self):
         """后台线程：定期刷新 agent 列表。"""
         # 启动时立即获取一次
-        self._agents = fetch_agents()
-        log.info("初始 agent 列表: %d 个", len(self._agents))
+        try:
+            self._agents = fetch_agents()
+            log.info("初始 agent 列表: %d 个", len(self._agents))
+        except Exception:
+            log.exception("初始 agent 列表获取失败")
         while self._running:
             time.sleep(60)
             try:
@@ -1057,6 +1398,9 @@ class TrayMonitor:
         log.info("Syncthing: %s | OpenClaw: %s",
                  CONFIG["syncthing_exe"], CONFIG["openclaw_cmd"])
 
+        # 预启动 UI 线程，避免首次打开设置时再抢建 Tk
+        get_ui_root()
+
         self.icon = pystray.Icon(
             name="tray-monitor",
             icon=ICON_BASE.resize(TRAY_ICON_SIZE, Image.Resampling.LANCZOS),
@@ -1064,10 +1408,10 @@ class TrayMonitor:
             menu=self._build_menu(),
         )
 
-        monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True, name="monitor")
         monitor_thread.start()
 
-        agent_thread = threading.Thread(target=self._agent_refresh_loop, daemon=True)
+        agent_thread = threading.Thread(target=self._agent_refresh_loop, daemon=True, name="agents")
         agent_thread.start()
 
         self.icon.run()
