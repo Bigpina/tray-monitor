@@ -11,6 +11,7 @@
 - ⏸ **暂停监控**：手动暂停检测和重启
 - 🔄 **自动重启**：检测到进程退出后自动拉起（通过系统服务）
 - 🛡️ **失败保护**：连续失败 N 次后冷却，避免无限重启
+- 📈 **Token Plan 用量**：托盘悬停/状态行显示套餐与本月用量百分比，超额提醒（默认 90% 触发日志+弹窗）
 - 📋 **更新说明**：右键菜单查看版本变更历史
 
 ## 文件结构
@@ -18,7 +19,8 @@
 ```
 tray-monitor/
 ├── src/
-│   └── tray_monitor.py          # 主程序
+│   ├── tray_monitor.py          # 主程序
+│   └── usage_client.py          # Token Plan 用量查询（独立可测）
 ├── icons/
 │   ├── lobster.ico              # 托盘图标
 │   └── lobster.png
@@ -70,6 +72,9 @@ copy config.example.json config.json
 | 日志级别 | DEBUG / INFO / WARNING / ERROR | `INFO` |
 | Gateway URL | Gateway HTTP 地址 | `http://127.0.0.1:18789` |
 | Gateway Token 文件 | openclaw.json 路径 | 自动检测 |
+| Cookie 文件 | MiMo 用量接口的登录 Cookie 存放文件 | 程序目录 cookie.txt（可配） |
+| 用量查询间隔（秒） | 多久查一次 Token Plan 用量（≥60） | `600` |
+| 超额提醒阈值（%） | 用量达到该百分比时提醒，0=关闭 | `90` |
 
 ## 启动
 
@@ -121,3 +126,4 @@ git log --oneline          # 查看提交历史
 - **图标**：基础图标 + 右下角状态圆点叠加（绿/蓝/灰）
 - **线程模型**：主线程运行托盘事件循环，后台守护线程执行监控
 - **配置窗口**：tkinter（Python 内置），在独立线程中运行
+- **用量查询**：标准库 urllib 直调控制台用量接口（Cookie 文件鉴权），独立守护线程轮询，与服务监控完全隔离，失败只降级显示不干扰监控

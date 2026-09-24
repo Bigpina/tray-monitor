@@ -17,10 +17,13 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+# 本地模块（与 tray_monitor.py 同目录）
+from usage_client import UsageError, fetch_usage, format_status, load_cookie, summarize
+
 # ---------------------------------------------------------------------------
 # 版本号
 # ---------------------------------------------------------------------------
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 import psutil
 import pystray
@@ -65,6 +68,9 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
     "gateway_url": "http://127.0.0.1:18789",
     "gateway_token_file": r"C:\Users\LiYuanbo\.openclaw\openclaw.json",
+    "usage_cookie_file": r"D:\openclaw\alpha\mimo-usage\cookie.txt",
+    "usage_interval": 600,
+    "usage_alert_percent": 90,
 }
 
 # ---------------------------------------------------------------------------
@@ -695,7 +701,7 @@ class SettingsWindow:
 
         self.win = tk.Toplevel(root)
         self.win.title(f"设置 · 托盘监控 v{__version__}")
-        self.win.geometry("560x640")
+        self.win.geometry("560x770")
         self.win.minsize(520, 560)
         self.win.configure(bg="#F3F3F3")
 
@@ -761,6 +767,35 @@ class SettingsWindow:
         ]):
             cell = ttk.Frame(g_mon)
             cell.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0))
+            ttk.Label(cell, text=label, font=self.FONT_UI,
+                      foreground=self.CLR_MUTED).pack(anchor="w", pady=(0, 4))
+            ttk.Entry(cell, textvariable=var, font=self.FONT_UI).pack(fill="x")
+
+        # --- Token Plan 用量 ---
+        g_usage = ttk.LabelFrame(outer, text=" Token Plan 用量 ", padding=10)
+        g_usage.pack(fill="x", pady=(0, 10))
+        for _c in (0, 1):
+            g_usage.columnconfigure(_c, weight=1)
+
+        ttk.Label(g_usage,
+                  text="Cookie 文件（浏览器 F12 → Network → usage 请求 → 复制 Cookie 值存为文件）",
+                  font=self.FONT_UI, foreground=self.CLR_MUTED).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        var_usage_file = tk.StringVar(value=cfg.get("usage_cookie_file", ""))
+        ttk.Entry(g_usage, textvariable=var_usage_file, font=self.FONT_MONO).grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=(0, 6))
+        ttk.Button(g_usage, text="浏览", width=6,
+                   command=lambda: self._browse_usage_file(var_usage_file)).grid(
+            row=1, column=2, sticky="e")
+
+        var_usage_interval = tk.StringVar(value=str(cfg.get("usage_interval", 600)))
+        var_usage_alert = tk.StringVar(value=str(cfg.get("usage_alert_percent", 90)))
+        for col, (label, var) in enumerate([
+            ("查询间隔（秒, ≥60）", var_usage_interval),
+            ("超额提醒阈值（%, 0=关）", var_usage_alert),
+        ]):
+            cell = ttk.Frame(g_usage)
+            cell.grid(row=2, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(8, 0))
             ttk.Label(cell, text=label, font=self.FONT_UI,
                       foreground=self.CLR_MUTED).pack(anchor="w", pady=(0, 4))
             ttk.Entry(cell, textvariable=var, font=self.FONT_UI).pack(fill="x")
@@ -833,12 +868,14 @@ class SettingsWindow:
                    command=lambda: self._restore_defaults(
                        var_st, var_oc, var_node, var_mjs,
                        var_interval, var_maxfail, var_cooldown, var_loglevel,
+                       var_usage_file, var_usage_interval, var_usage_alert,
                        self._render_cli_panel)).pack(side="left", padx=(0, 6))
         ttk.Button(btns, text="取消", width=8, command=self._cancel).pack(side="left", padx=(0, 6))
         ttk.Button(btns, text="保存", width=8,
                    command=lambda: self._save(
                        var_st, var_oc, var_node, var_mjs,
-                       var_interval, var_maxfail, var_cooldown, var_loglevel)).pack(side="left")
+                       var_interval, var_maxfail, var_cooldown, var_loglevel,
+                       var_usage_file, var_usage_interval, var_usage_alert)).pack(side="left")
 
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
         self.win.focus_force()
@@ -904,6 +941,14 @@ class SettingsWindow:
         if path:
             var.set(path)
 
+    def _browse_usage_file(self, var):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择 Cookie 文件",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+        if path:
+            var.set(path)
+
     def _scan_syncthing(self, var):
         from tkinter import messagebox
         candidates = _find_syncthing_candidates()
@@ -955,7 +1000,8 @@ class SettingsWindow:
         tk.Button(btn_frame, text="取消", width=10, command=win.destroy).pack(side="left", padx=5)
 
     def _save(self, var_st, var_oc, var_node, var_mjs,
-              var_interval, var_maxfail, var_cooldown, var_loglevel):
+              var_interval, var_maxfail, var_cooldown, var_loglevel,
+              var_usage_file, var_usage_interval, var_usage_alert):
         from tkinter import messagebox
         try:
             interval = int(var_interval.get())
@@ -963,8 +1009,16 @@ class SettingsWindow:
             cooldown = int(var_cooldown.get())
             if interval < 1 or maxfail < 1 or cooldown < 1:
                 raise ValueError("数值必须 >= 1")
+            usage_interval = int(var_usage_interval.get())
+            usage_alert = float(var_usage_alert.get())
+            if usage_interval < 60:
+                raise ValueError("用量查询间隔必须 >= 60 秒")
+            if not 0 <= usage_alert <= 100:
+                raise ValueError("用量提醒阈值需在 0~100 之间")
+            if usage_alert == int(usage_alert):
+                usage_alert = int(usage_alert)
         except ValueError as e:
-            messagebox.showerror("参数错误", f"请输入有效的正整数。\n{e}")
+            messagebox.showerror("参数错误", f"请输入有效的数值。\n{e}")
             return
 
         new_cfg = {
@@ -979,6 +1033,9 @@ class SettingsWindow:
             "log_level": var_loglevel.get(),
             "gateway_url": CONFIG.get("gateway_url", ""),
             "gateway_token_file": CONFIG.get("gateway_token_file", ""),
+            "usage_cookie_file": var_usage_file.get().strip(),
+            "usage_interval": usage_interval,
+            "usage_alert_percent": usage_alert,
         }
 
         save_config(new_cfg)
@@ -1007,6 +1064,7 @@ class SettingsWindow:
 
     def _restore_defaults(self, var_st, var_oc, var_node, var_mjs,
                           var_interval, var_maxfail, var_cooldown, var_loglevel,
+                          var_usage_file, var_usage_interval, var_usage_alert,
                           refresh_cli=None):
         var_st.set(DEFAULT_CONFIG["syncthing_exe"])
         var_oc.set(DEFAULT_CONFIG["openclaw_cmd"])
@@ -1016,6 +1074,9 @@ class SettingsWindow:
         var_maxfail.set(str(DEFAULT_CONFIG["max_fail_count"]))
         var_cooldown.set(str(DEFAULT_CONFIG["cooldown_seconds"]))
         var_loglevel.set(DEFAULT_CONFIG["log_level"])
+        var_usage_file.set(DEFAULT_CONFIG.get("usage_cookie_file", ""))
+        var_usage_interval.set(str(DEFAULT_CONFIG.get("usage_interval", 600)))
+        var_usage_alert.set(str(DEFAULT_CONFIG.get("usage_alert_percent", 90)))
         if refresh_cli:
             refresh_cli()
 
@@ -1236,6 +1297,14 @@ class TrayMonitor:
         self._settings_window: SettingsWindow | None = None
         self._changelog_window: ChangelogWindow | None = None
         self._agents: list[dict] = []
+        # Token Plan 用量状态
+        self._last_gw: str | None = None
+        self._last_st: str | None = None
+        self._usage_line = "用量: 查询中..."
+        self._usage_ok = False
+        self._usage_last_err: str | None = None
+        self._usage_alerted = False
+        self._usage_data: dict | None = None
 
     # --- 图标更新 ---
 
@@ -1253,24 +1322,40 @@ class TrayMonitor:
         st_ok = (st == "ok")
         return build_status_icon(gw_ok, st_ok)
 
-    def _update_icon(self, gw: str, st: str):
+    def _compose_status_text(self, gw: str | None, st: str | None) -> str:
         if self.state.paused:
             line1 = "⏸ 监控已暂停"
+        elif gw is None or st is None:
+            line1 = "启动中..."
         else:
             gw_label = {"ok": "正常", "restart": "重启中", "cooldown": "冷却中"}.get(gw, gw)
             st_label = {"ok": "正常", "restart": "重启中", "cooldown": "冷却中"}.get(st, st)
             line1 = f"Gateway: {gw_label} | Syncthing: {st_label}"
+        parts = [line1]
         line2 = _format_agents_line(self._agents)
-        self._status_text = line1 + ("\n" + line2 if line2 else "")
+        if line2:
+            parts.append(line2)
+        if self._usage_line:
+            parts.append(self._usage_line)
+        return "\n".join(parts)
+
+    def _apply_status(self):
+        """按最近一次 gw/st 重建状态文本并刷新托盘（用量线程也走这里）。"""
+        self._status_text = self._compose_status_text(self._last_gw, self._last_st)
         if not self.icon:
             return
         with _icon_lock:
             try:
-                self.icon.icon = self._pick_icon(gw, st)
+                if self._last_gw is not None:
+                    self.icon.icon = self._pick_icon(self._last_gw, self._last_st)
                 self.icon.title = self._status_text
                 self.icon.update_menu()
             except Exception:
                 log.exception("更新托盘图标/菜单失败")
+
+    def _update_icon(self, gw: str, st: str):
+        self._last_gw, self._last_st = gw, st
+        self._apply_status()
 
     # --- 监控循环 ---
 
@@ -1310,6 +1395,91 @@ class TrayMonitor:
             except Exception:
                 log.exception("监控循环异常，稍后重试")
                 self._interruptible_sleep(max(5, int(CONFIG.get("check_interval", 10))))
+
+    # --- Token Plan 用量 ---
+
+    def _usage_cookie_path(self) -> str:
+        p = (CONFIG.get("usage_cookie_file") or "").strip()
+        if p:
+            return p
+        return str(PROJECT_ROOT / "cookie.txt")
+
+    def _usage_refresh_once(self):
+        """查询一次用量并刷新状态行。任何异常都只降级用量行，绝不影响服务监控。"""
+        try:
+            cookie = load_cookie(self._usage_cookie_path())
+            data = fetch_usage(cookie)
+            s = summarize(data)
+            new_line = format_status(s)
+            changed = (not self._usage_ok) or (new_line != self._usage_line)
+            self._usage_ok = True
+            self._usage_last_err = None
+            self._usage_data = s
+            self._usage_line = new_line
+
+            # 超额提醒：跨过阈值触发一次，降回阈值内后允许再次触发
+            threshold = float(CONFIG.get("usage_alert_percent", 0) or 0)
+            pct = s["plan_percent"] * 100
+            if threshold > 0 and pct >= threshold:
+                if not self._usage_alerted:
+                    self._usage_alerted = True
+                    log.warning("用量已达阈值: %.2f%% (阈值 %s%%)", pct, threshold)
+                    self._notify_usage(pct, threshold)
+            elif self._usage_alerted and pct < threshold:
+                self._usage_alerted = False
+
+            if changed:
+                log.info("用量已更新: %s", new_line)
+            self._apply_status()
+        except UsageError as e:
+            self._usage_ok = False
+            label = {"auth": "Cookie失效", "nocookie": "未配置",
+                     "net": "查询失败", "http": "查询失败", "shape": "响应异常"}.get(
+                         e.kind, "查询失败")
+            self._usage_line = f"用量: {label}"
+            if e.kind != self._usage_last_err:
+                self._usage_last_err = e.kind
+                log.warning("用量查询失败 [%s]: %s", e.kind, e)
+            self._apply_status()
+        except Exception:
+            self._usage_ok = False
+            self._usage_line = "用量: 查询失败"
+            if self._usage_last_err != "unknown":
+                self._usage_last_err = "unknown"
+                log.exception("用量查询异常")
+            self._apply_status()
+
+    def _notify_usage(self, pct: float, threshold: float):
+        """阈值提醒弹窗（失败只记日志，不影响运行）。"""
+        def _show():
+            try:
+                import tkinter.messagebox as mb
+                root = get_ui_root()
+                if root is not None:
+                    mb.showwarning(
+                        "MiMo 用量提醒",
+                        f"Token Plan 套餐用量已达 {pct:.2f}%\n（提醒阈值 {threshold:g}%）",
+                        parent=root)
+            except Exception:
+                log.exception("用量提醒弹窗失败")
+
+        try:
+            run_on_ui(_show)
+        except Exception:
+            log.exception("提交用量提醒失败")
+
+    def _usage_loop(self):
+        """后台线程：独立轮询 Token Plan 用量（与 check_interval 解耦，下限 60s 防风控）。"""
+        while self._running:
+            try:
+                self._usage_refresh_once()
+            except Exception:
+                log.exception("用量循环异常")
+            try:
+                interval = int(CONFIG.get("usage_interval", 600) or 600)
+            except (TypeError, ValueError):
+                interval = 600
+            self._interruptible_sleep(max(60, interval))
 
     # --- 菜单 ---
 
@@ -1413,6 +1583,9 @@ class TrayMonitor:
 
         agent_thread = threading.Thread(target=self._agent_refresh_loop, daemon=True, name="agents")
         agent_thread.start()
+
+        usage_thread = threading.Thread(target=self._usage_loop, daemon=True, name="usage")
+        usage_thread.start()
 
         self.icon.run()
 
