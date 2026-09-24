@@ -120,10 +120,9 @@ def _fmt_tokens(n: int) -> str:
 
 
 def format_status(s: dict) -> str:
-    """一行状态文本: 用量: 套餐74.00% 本月73.81% (28.05B/38.00B)"""
+    """一行状态文本: 用量: 本月74.96% (28.48B/38.00B)"""
     return (
-        f"用量: 套餐{s['plan_percent']:.2%} "
-        f"本月{s['month_percent']:.2%} "
+        f"用量: 本月{s['month_percent']:.2%} "
         f"({_fmt_tokens(s['used'])}/{_fmt_tokens(s['limit'])})"
     )
 

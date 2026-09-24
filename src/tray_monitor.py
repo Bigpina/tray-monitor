@@ -24,7 +24,7 @@ from usage_client import UsageError, format_status, query_usage_candidates, summ
 # ---------------------------------------------------------------------------
 # 版本号
 # ---------------------------------------------------------------------------
-__version__ = "4.3.0"
+__version__ = "4.3.1"
 
 import psutil
 import pystray
