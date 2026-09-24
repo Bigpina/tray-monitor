@@ -78,7 +78,6 @@ copy config.example.json config.json
 | 日志级别 | DEBUG / INFO / WARNING / ERROR | `INFO` |
 | Gateway URL | Gateway HTTP 地址 | `http://127.0.0.1:18789` |
 | Gateway Token 文件 | openclaw.json 路径 | 自动检测 |
-| Cookie 文件 | MiMo 用量接口的登录 Cookie 存放文件 | 程序目录 cookie.txt（可配） |
 | 用量查询间隔（秒） | 多久查一次 Token Plan 用量（≥60） | `600` |
 | 超额提醒阈值（%） | 用量达到该百分比时提醒，0=关闭 | `90` |
 | 同步监听端口 | 扩展推送 Cookie 的本地端口，0=关闭 | `39247` |
@@ -93,7 +92,7 @@ copy config.example.json config.json
 4. 扩展每分钟（及登录态变化时防抖 2s 后）把 Cookie POST 到 `http://127.0.0.1:39247/cookie`，
    托盘写入 `cookie_autosync.txt` 并立即刷新用量
 
-查询优先级：**扩展推送（cookie_autosync.txt）> 配置的 cookie.txt**，前者 401 自动回退后者。
+Cookie 唯一来源：**Edge 扩展自动推送（cookie_autosync.txt）**，扩展未推送时用量显示降级（不回退 cookie.txt）。
 不想用时在 config.json 设 `"usage_sync_port": 0` 关闭监听。
 
 安全约束：监听仅绑定 127.0.0.1；校验 Origin（仅 `chrome-extension://` 或缺省，其余 403）；

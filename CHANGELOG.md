@@ -2,6 +2,11 @@
 
 所有版本的变更说明。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [4.3.3] - 2026-09-24
+
+### 变更
+- **移除 cookie.txt 兜底**：用量查询 Cookie 唯一来源改为 Edge 扩展推送的 cookie_autosync.txt——兜底文件在新设备上不存在、内容也大概率已 401，回退无意义。删除 `usage_cookie_file` 配置字段与设置窗「Cookie 文件」输入（说明改为「Cookie 由 Edge 扩展自动推送，无需手动配置」）；扩展未推送时用量行降级并提示安装/登录扩展，不再回退配置文件
+
 ## [4.3.2] - 2026-09-24
 
 ### 变更

@@ -19,12 +19,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # 本地模块（与 tray_monitor.py 同目录）
-from usage_client import UsageError, format_status, query_usage_candidates, summarize
+from usage_client import UsageError, format_status, query_usage, summarize
 
 # ---------------------------------------------------------------------------
 # 版本号
 # ---------------------------------------------------------------------------
-__version__ = "4.3.2"
+__version__ = "4.3.3"
 
 import psutil
 import pystray
@@ -69,7 +69,6 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
     "gateway_url": "http://127.0.0.1:18789",
     "gateway_token_file": r"C:\Users\LiYuanbo\.openclaw\openclaw.json",
-    "usage_cookie_file": r"D:\openclaw\alpha\mimo-usage\cookie.txt",
     "usage_interval": 600,
     "usage_alert_percent": 90,
     "usage_sync_port": 39247,
@@ -716,7 +715,7 @@ class SettingsWindow:
 
         self.win = tk.Toplevel(root)
         self.win.title(f"设置 · 托盘监控 v{__version__}")
-        self.win.geometry("560x800")
+        self.win.geometry("560x770")
         self.win.minsize(520, 560)
         self.win.configure(bg="#F3F3F3")
 
@@ -798,15 +797,9 @@ class SettingsWindow:
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
         ttk.Label(g_usage,
-                  text="Cookie 文件（浏览器 F12 → Network → usage 请求 → 复制 Cookie 值存为文件）",
+                  text="Cookie 由 Edge 扩展自动推送（cookie_autosync.txt），无需手动配置",
                   font=self.FONT_UI, foreground=self.CLR_MUTED).grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(0, 4))
-        var_usage_file = tk.StringVar(value=cfg.get("usage_cookie_file", ""))
-        ttk.Entry(g_usage, textvariable=var_usage_file, font=self.FONT_MONO).grid(
-            row=2, column=0, columnspan=2, sticky="ew", padx=(0, 6))
-        ttk.Button(g_usage, text="浏览", width=6,
-                   command=lambda: self._browse_usage_file(var_usage_file)).grid(
-            row=2, column=2, sticky="e")
 
         var_usage_interval = tk.StringVar(value=str(cfg.get("usage_interval", 600)))
         var_usage_alert = tk.StringVar(value=str(cfg.get("usage_alert_percent", 90)))
@@ -815,7 +808,7 @@ class SettingsWindow:
             ("超额提醒阈值（%, 0=关）", var_usage_alert),
         ]):
             cell = ttk.Frame(g_usage)
-            cell.grid(row=3, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(8, 0))
+            cell.grid(row=2, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(8, 0))
             ttk.Label(cell, text=label, font=self.FONT_UI,
                       foreground=self.CLR_MUTED).pack(anchor="w", pady=(0, 4))
             ttk.Entry(cell, textvariable=var, font=self.FONT_UI).pack(fill="x")
@@ -888,7 +881,7 @@ class SettingsWindow:
                    command=lambda: self._restore_defaults(
                        var_st, var_oc, var_node, var_mjs,
                        var_interval, var_maxfail, var_cooldown, var_loglevel,
-                       var_usage_file, var_usage_interval, var_usage_alert,
+                       var_usage_interval, var_usage_alert,
                        self._render_cli_panel)).pack(side="left", padx=(0, 6))
         ttk.Button(btns, text="取消", width=8, command=self._cancel).pack(side="left", padx=(0, 6))
         ttk.Button(btns, text="保存", width=8,
@@ -969,14 +962,6 @@ class SettingsWindow:
         path = filedialog.askopenfilename(
             title="选择可执行文件",
             filetypes=[("可执行文件", "*.exe;*.cmd;*.bat;*.ps1"), ("所有文件", "*.*")])
-        if path:
-            var.set(path)
-
-    def _browse_usage_file(self, var):
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="选择 Cookie 文件",
-            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
         if path:
             var.set(path)
 
@@ -1064,7 +1049,6 @@ class SettingsWindow:
             "log_level": var_loglevel.get(),
             "gateway_url": CONFIG.get("gateway_url", ""),
             "gateway_token_file": CONFIG.get("gateway_token_file", ""),
-            "usage_cookie_file": var_usage_file.get().strip(),
             "usage_interval": usage_interval,
             "usage_alert_percent": usage_alert,
         }
@@ -1095,7 +1079,7 @@ class SettingsWindow:
 
     def _restore_defaults(self, var_st, var_oc, var_node, var_mjs,
                           var_interval, var_maxfail, var_cooldown, var_loglevel,
-                          var_usage_file, var_usage_interval, var_usage_alert,
+                          var_usage_interval, var_usage_alert,
                           refresh_cli=None):
         var_st.set(DEFAULT_CONFIG["syncthing_exe"])
         var_oc.set(DEFAULT_CONFIG["openclaw_cmd"])
@@ -1105,7 +1089,6 @@ class SettingsWindow:
         var_maxfail.set(str(DEFAULT_CONFIG["max_fail_count"]))
         var_cooldown.set(str(DEFAULT_CONFIG["cooldown_seconds"]))
         var_loglevel.set(DEFAULT_CONFIG["log_level"])
-        var_usage_file.set(DEFAULT_CONFIG.get("usage_cookie_file", ""))
         var_usage_interval.set(str(DEFAULT_CONFIG.get("usage_interval", 600)))
         var_usage_alert.set(str(DEFAULT_CONFIG.get("usage_alert_percent", 90)))
         if refresh_cli:
@@ -1553,16 +1536,10 @@ class TrayMonitor:
 
     # --- Token Plan 用量 ---
 
-    def _usage_cookie_path(self) -> str:
-        p = (CONFIG.get("usage_cookie_file") or "").strip()
-        if p:
-            return p
-        return str(PROJECT_ROOT / "cookie.txt")
-
     def _usage_refresh_once(self):
         """查询一次用量并刷新状态行。任何异常都只降级用量行，绝不影响服务监控。"""
         try:
-            data, source = query_usage_candidates(AUTOSYNC_PATH, self._usage_cookie_path())
+            data, source = query_usage(AUTOSYNC_PATH)
             s = summarize(data)
             new_line = format_status(s)
             changed = ((not self._usage_ok) or (new_line != self._usage_line)

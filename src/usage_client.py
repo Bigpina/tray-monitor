@@ -127,36 +127,22 @@ def format_status(s: dict) -> str:
     )
 
 
-def query_usage_candidates(
-    autosync_path: str | None, configured_path: str | None
-) -> tuple[dict, str]:
-    """按优先级尝试候选 Cookie：扩展自动推送(cookie_autosync.txt)优先，
-    配置的 cookie.txt 兜底。返回 (data, 来源标签)。
-    候选逐一尝试：401 换下一个，其他错误立即抛出。消息绝不含 cookie 内容。"""
-    pairs: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for label, path in (("扩展推送", autosync_path), ("配置文件", configured_path)):
-        if not path:
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                val = f.read().strip()
-        except OSError:
-            continue
-        if val and val not in seen:
-            seen.add(val)
-            pairs.append((label, val))
-    if not pairs:
+def query_usage(autosync_path: str | None) -> tuple[dict, str]:
+    """用 Edge 扩展推送的 Cookie 文件查询用量，返回 (data, 来源标签)。
+    Cookie 唯一来源是扩展推送的 cookie_autosync.txt；不支持配置的 cookie.txt
+    兜底——新设备上该文件不存在，内容也大概率已失效，兜底无意义。
+    消息绝不含 cookie 内容。"""
+    if not autosync_path:
+        raise UsageError("nocookie", "未配置扩展推送 Cookie 文件路径")
+    try:
+        with open(autosync_path, "r", encoding="utf-8") as f:
+            val = f.read().strip()
+    except OSError:
+        val = ""
+    if not val:
         raise UsageError(
-            "nocookie", "Cookie 文件均不可读或为空 (cookie_autosync.txt / cookie.txt)"
+            "nocookie",
+            "未收到扩展推送的 Cookie (cookie_autosync.txt 不存在或为空)，"
+            "请确认 Edge 扩展已安装并登录平台",
         )
-    last_auth: UsageError | None = None
-    for label, val in pairs:
-        try:
-            return fetch_usage(val), label
-        except UsageError as e:
-            if e.kind == "auth":
-                last_auth = e  # 该来源已 401，换下一个候选
-                continue
-            raise
-    raise last_auth if last_auth else UsageError("auth", "Cookie 已失效")
+    return fetch_usage(val), "扩展推送"
