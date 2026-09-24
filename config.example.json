@@ -12,5 +12,6 @@
   "gateway_token_file": "",
   "usage_cookie_file": "",
   "usage_interval": 600,
-  "usage_alert_percent": 90
+  "usage_alert_percent": 90,
+  "usage_sync_port": 39247
 }

@@ -14,6 +14,10 @@ __pycache__/
 *.pyo
 *.egg-info/
 
+# Cookie 自动同步（凭证，绝不入库）
+cookie_autosync.txt
+cookie_autosync.txt.tmp
+
 # 日志
 logs/
 

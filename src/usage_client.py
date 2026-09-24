@@ -126,3 +126,38 @@ def format_status(s: dict) -> str:
         f"本月{s['month_percent']:.2%} "
         f"({_fmt_tokens(s['used'])}/{_fmt_tokens(s['limit'])})"
     )
+
+
+def query_usage_candidates(
+    autosync_path: str | None, configured_path: str | None
+) -> tuple[dict, str]:
+    """按优先级尝试候选 Cookie：扩展自动推送(cookie_autosync.txt)优先，
+    配置的 cookie.txt 兜底。返回 (data, 来源标签)。
+    候选逐一尝试：401 换下一个，其他错误立即抛出。消息绝不含 cookie 内容。"""
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for label, path in (("扩展推送", autosync_path), ("配置文件", configured_path)):
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+        except OSError:
+            continue
+        if val and val not in seen:
+            seen.add(val)
+            pairs.append((label, val))
+    if not pairs:
+        raise UsageError(
+            "nocookie", "Cookie 文件均不可读或为空 (cookie_autosync.txt / cookie.txt)"
+        )
+    last_auth: UsageError | None = None
+    for label, val in pairs:
+        try:
+            return fetch_usage(val), label
+        except UsageError as e:
+            if e.kind == "auth":
+                last_auth = e  # 该来源已 401，换下一个候选
+                continue
+            raise
+    raise last_auth if last_auth else UsageError("auth", "Cookie 已失效")

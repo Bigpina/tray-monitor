@@ -12,6 +12,7 @@
 - 🔄 **自动重启**：检测到进程退出后自动拉起（通过系统服务）
 - 🛡️ **失败保护**：连续失败 N 次后冷却，避免无限重启
 - 📈 **Token Plan 用量**：托盘悬停/状态行显示套餐与本月用量百分比，超额提醒（默认 90% 触发日志+弹窗）
+- 🍪 **Cookie 自动同步**：Edge 扩展定时/登录态变化时推送 Cookie，浏览器重登或轮换后托盘自动跟上，无需手工复制
 - 📋 **更新说明**：右键菜单查看版本变更历史
 
 ## 文件结构
@@ -21,6 +22,10 @@ tray-monitor/
 ├── src/
 │   ├── tray_monitor.py          # 主程序
 │   └── usage_client.py          # Token Plan 用量查询（独立可测）
+├── edge-extension/              # Edge 扩展：Cookie 自动同步推送
+│   ├── manifest.json
+│   ├── background.js            # 定时/登录态变化时推送 Cookie
+│   └── popup.html / popup.js    # 状态弹窗
 ├── icons/
 │   ├── lobster.ico              # 托盘图标
 │   └── lobster.png
@@ -75,6 +80,23 @@ copy config.example.json config.json
 | Cookie 文件 | MiMo 用量接口的登录 Cookie 存放文件 | 程序目录 cookie.txt（可配） |
 | 用量查询间隔（秒） | 多久查一次 Token Plan 用量（≥60） | `600` |
 | 超额提醒阈值（%） | 用量达到该百分比时提醒，0=关闭 | `90` |
+| 同步监听端口 | 扩展推送 Cookie 的本地端口，0=关闭 | `39247` |
+
+## Cookie 自动同步（Edge 扩展，推荐）
+
+手动复制的 Cookie 会过期，推荐安装配套扩展实现全自动同步：
+
+1. Edge 打开 `edge://extensions/`，开启「开发人员模式」
+2. 点「加载解压缩的扩展」，选择本仓库的 `edge-extension/` 文件夹
+3. 确保已在 Edge 登录 [platform.xiaomimimo.com](https://platform.xiaomimimo.com/console/plan-manage)
+4. 扩展每分钟（及登录态变化时防抖 2s 后）把 Cookie POST 到 `http://127.0.0.1:39247/cookie`，
+   托盘写入 `cookie_autosync.txt` 并立即刷新用量
+
+查询优先级：**扩展推送（cookie_autosync.txt）> 配置的 cookie.txt**，前者 401 自动回退后者。
+不想用时在 config.json 设 `"usage_sync_port": 0` 关闭监听。
+
+安全约束：监听仅绑定 127.0.0.1；校验 Origin（仅 `chrome-extension://` 或缺省，其余 403）；
+请求体 ≤64KB；必须含必需 Cookie 名才落盘；日志绝不打印 Cookie 内容。
 
 ## 启动
 
@@ -127,3 +149,4 @@ git log --oneline          # 查看提交历史
 - **线程模型**：主线程运行托盘事件循环，后台守护线程执行监控
 - **配置窗口**：tkinter（Python 内置），在独立线程中运行
 - **用量查询**：标准库 urllib 直调控制台用量接口（Cookie 文件鉴权），独立守护线程轮询，与服务监控完全隔离，失败只降级显示不干扰监控
+- **Cookie 自动同步**：内置 127.0.0.1 HTTP 监听接收 Edge 扩展推送，Origin 校验 + 必需 Cookie 名校验，原子落盘，Event 唤醒用量线程即时刷新

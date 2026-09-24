@@ -15,15 +15,16 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # 本地模块（与 tray_monitor.py 同目录）
-from usage_client import UsageError, fetch_usage, format_status, load_cookie, summarize
+from usage_client import UsageError, format_status, query_usage_candidates, summarize
 
 # ---------------------------------------------------------------------------
 # 版本号
 # ---------------------------------------------------------------------------
-__version__ = "4.2.0"
+__version__ = "4.3.0"
 
 import psutil
 import pystray
@@ -71,6 +72,7 @@ DEFAULT_CONFIG = {
     "usage_cookie_file": r"D:\openclaw\alpha\mimo-usage\cookie.txt",
     "usage_interval": 600,
     "usage_alert_percent": 90,
+    "usage_sync_port": 39247,
 }
 
 # ---------------------------------------------------------------------------
@@ -1288,6 +1290,125 @@ class ChangelogWindow:
 # 托盘程序主逻辑
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Cookie 自动同步监听（Edge 扩展 → 127.0.0.1）
+# ---------------------------------------------------------------------------
+AUTOSYNC_PATH = str(PROJECT_ROOT / "cookie_autosync.txt")
+_MAX_COOKIE_BODY = 64 * 1024
+_REQUIRED_COOKIE_NAMES = {"api-platform_serviceToken", "userId"}
+
+
+def _parse_cookie_names(cookie: str) -> set[str]:
+    """从 'a=1; b=2' 中提取 cookie 名集合（不保留值）。"""
+    names = set()
+    for part in cookie.split(";"):
+        if "=" in part:
+            names.add(part.split("=", 1)[0].strip())
+    return names
+
+
+def _write_autosync(content: str) -> bool:
+    """原子写入 cookie_autosync.txt；内容无变化返回 False。"""
+    try:
+        with open(AUTOSYNC_PATH, "r", encoding="utf-8") as f:
+            if f.read().strip() == content:
+                return False
+    except OSError:
+        pass
+    tmp = AUTOSYNC_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, AUTOSYNC_PATH)
+    return True
+
+
+class _AutosyncHandler(BaseHTTPRequestHandler):
+    """接收 Edge 扩展的 Cookie 推送。
+
+    安全约束：仅绑定 127.0.0.1；Origin 必须缺省（本机工具）或
+    chrome-extension://（浏览器扩展），其余一律 403；请求体 ≤64KB；
+    必须含必需 Cookie 名才落盘。日志绝不打印 Cookie 内容。
+    """
+    on_cookie = None  # 由监听线程注入: fn(new_content: str) -> None
+
+    def log_message(self, fmt, *args):
+        """静默默认访问日志（避免刷屏/泄漏）。"""
+
+    def _reply(self, code: int, msg: str):
+        try:
+            body = msg.encode("utf-8")
+            origin = self.headers.get("Origin") or ""
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if origin.startswith("chrome-extension://"):
+                # 扩展 fetch 跨源读取，不回 ACAO 扩展侧会 Failed to fetch
+                self.send_header("Access-Control-Allow-Origin", origin)
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_OPTIONS(self):
+        """CORS 预检（text/plain 简单请求通常不触发，防御性支持）。"""
+        origin = self.headers.get("Origin") or ""
+        if not origin.startswith("chrome-extension://"):
+            self._reply(403, "bad origin")
+            return
+        try:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except Exception:
+            pass
+
+    def do_POST(self):
+        if self.path != "/cookie":
+            log.warning("同步请求路径错误: %s", self.path)
+            self._reply(404, "not found")
+            return
+        origin = self.headers.get("Origin") or ""
+        if origin and not origin.startswith("chrome-extension://"):
+            log.warning("同步请求被拒 [origin]: %s", origin)
+            self._reply(403, "bad origin")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > _MAX_COOKIE_BODY:
+            log.warning("同步请求被拒 [bad length]: %s", length)
+            self._reply(400, "bad length")
+            return
+        body = self.rfile.read(length).decode("utf-8", "replace").strip()
+        if not body:
+            log.warning("同步请求被拒 [empty body]")
+            self._reply(400, "empty")
+            return
+        names = _parse_cookie_names(body)
+        if not _REQUIRED_COOKIE_NAMES <= names:
+            log.warning("同步请求被拒 [missing cookies]: 收到 %d 个, 缺 %s",
+                        len(names), sorted(_REQUIRED_COOKIE_NAMES - names))
+            self._reply(400, "missing required cookies")
+            return
+        try:
+            changed = _write_autosync(body)
+        except OSError as e:
+            log.error("写入 cookie_autosync.txt 失败: %s", e)
+            self._reply(500, "write failed")
+            return
+        if changed and self.on_cookie is not None:
+            try:
+                self.on_cookie(body)
+            except Exception:
+                log.exception("Cookie 推送回调异常")
+        self._reply(200, "ok" if changed else "unchanged")
+
+
 class TrayMonitor:
     def __init__(self):
         self.state = MonitorState()
@@ -1305,6 +1426,9 @@ class TrayMonitor:
         self._usage_last_err: str | None = None
         self._usage_alerted = False
         self._usage_data: dict | None = None
+        self._usage_source = ""
+        self._usage_wake = threading.Event()   # 扩展推送新 Cookie 时唤醒用量线程
+        self._usage_sync_server: HTTPServer | None = None
 
     # --- 图标更新 ---
 
@@ -1407,11 +1531,12 @@ class TrayMonitor:
     def _usage_refresh_once(self):
         """查询一次用量并刷新状态行。任何异常都只降级用量行，绝不影响服务监控。"""
         try:
-            cookie = load_cookie(self._usage_cookie_path())
-            data = fetch_usage(cookie)
+            data, source = query_usage_candidates(AUTOSYNC_PATH, self._usage_cookie_path())
             s = summarize(data)
             new_line = format_status(s)
-            changed = (not self._usage_ok) or (new_line != self._usage_line)
+            changed = ((not self._usage_ok) or (new_line != self._usage_line)
+                       or (source != self._usage_source))
+            self._usage_source = source
             self._usage_ok = True
             self._usage_last_err = None
             self._usage_data = s
@@ -1429,7 +1554,7 @@ class TrayMonitor:
                 self._usage_alerted = False
 
             if changed:
-                log.info("用量已更新: %s", new_line)
+                log.info("用量已更新 [%s]: %s", source, new_line)
             self._apply_status()
         except UsageError as e:
             self._usage_ok = False
@@ -1469,8 +1594,10 @@ class TrayMonitor:
             log.exception("提交用量提醒失败")
 
     def _usage_loop(self):
-        """后台线程：独立轮询 Token Plan 用量（与 check_interval 解耦，下限 60s 防风控）。"""
+        """后台线程：独立轮询 Token Plan 用量（与 check_interval 解耦，下限 60s 防风控）。
+        扩展推送新 Cookie 时经 _usage_wake 立即唤醒，不等下个周期。"""
         while self._running:
+            self._usage_wake.clear()  # 刷新前清标志：刷新期间的推送会穿透到 wait
             try:
                 self._usage_refresh_once()
             except Exception:
@@ -1479,7 +1606,38 @@ class TrayMonitor:
                 interval = int(CONFIG.get("usage_interval", 600) or 600)
             except (TypeError, ValueError):
                 interval = 600
-            self._interruptible_sleep(max(60, interval))
+            if self._running:
+                self._usage_wake.wait(timeout=max(60, interval))
+
+    # --- Cookie 自动同步监听（Edge 扩展推送） ---
+
+    def _usage_sync_loop(self):
+        """后台线程：127.0.0.1 监听 Edge 扩展推送的 Cookie。启动失败只告警不影响主功能。"""
+        try:
+            port = int(CONFIG.get("usage_sync_port", 39247) or 0)
+        except (TypeError, ValueError):
+            port = 39247
+        if port <= 0:
+            log.info("Cookie 自动同步监听已禁用 (usage_sync_port=0)")
+            return
+        handler = type("AutosyncHandler", (_AutosyncHandler,),
+                       {"on_cookie": self._on_cookie_pushed})
+        try:
+            server = HTTPServer(("127.0.0.1", port), handler)
+        except OSError as e:
+            log.warning("Cookie 自动同步监听启动失败 (端口 %d): %s", port, e)
+            return
+        self._usage_sync_server = server
+        log.info("Cookie 自动同步监听已启动: http://127.0.0.1:%d/cookie", port)
+        try:
+            server.serve_forever(poll_interval=1.0)
+        finally:
+            server.server_close()
+
+    def _on_cookie_pushed(self, content: str):
+        """扩展推送了新 Cookie：记日志并立即唤醒用量查询。"""
+        log.info("收到扩展 Cookie 推送 (%d 字节)，立即刷新用量", len(content))
+        self._usage_wake.set()
 
     # --- 菜单 ---
 
@@ -1587,7 +1745,18 @@ class TrayMonitor:
         usage_thread = threading.Thread(target=self._usage_loop, daemon=True, name="usage")
         usage_thread.start()
 
+        sync_thread = threading.Thread(target=self._usage_sync_loop, daemon=True, name="usage-sync")
+        sync_thread.start()
+
         self.icon.run()
+
+        # 退出收尾：关闭 Cookie 同步监听
+        if self._usage_sync_server is not None:
+            try:
+                self._usage_sync_server.shutdown()
+                self._usage_sync_server.server_close()
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # 入口

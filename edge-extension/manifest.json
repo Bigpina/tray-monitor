@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "MiMo Cookie Sync",
+  "version": "1.0.0",
+  "description": "把 platform.xiaomimimo.com 的登录态自动推送给本机 tray-monitor",
+  "permissions": ["cookies", "alarms", "storage", "webRequest"],
+  "host_permissions": [
+    "https://platform.xiaomimimo.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

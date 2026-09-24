@@ -2,6 +2,18 @@
 
 所有版本的变更说明。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [4.3.0] - 2026-09-24
+
+### 新增
+- **Cookie 自动同步**：配套 Edge 扩展（`edge-extension/`）自动把 `platform.xiaomimimo.com` 登录态推送给托盘内置的 127.0.0.1 监听（`usage_sync_port`，默认 39247）；浏览器登录/轮换 Cookie 后托盘自动跟上，无需手工复制 cookie.txt
+- 查询优先级：扩展推送（cookie_autosync.txt）> 配置的 cookie.txt，前者 401 自动回退后者；推送新 Cookie 经 Event 唤醒立即刷新用量（不等下个轮询周期）
+- 扩展弹窗显示推送状态/错误/手动同步按钮
+- **双通路取 Cookie**：cookies API 4 过滤并集 + `webRequest` 捕获页面请求头（本机 Edge 实测 getAll 时而返回空，捕获通路兕底）；扩展 fetch 跨源响应补 CORS（ACAO + OPTIONS 预检）；监听拒收分支记 WARNING（仅原因与 cookie 名，不记值）
+
+### 安全
+- 监听仅绑定 127.0.0.1；校验 Origin（缺省或 chrome-extension://，其余 403）；请求体上限 64KB；必须含 `api-platform_serviceToken` + `userId` 才落盘；日志绝不打印 Cookie 内容
+- `cookie_autosync.txt`（凭证）已加入 .gitignore
+
 ## [4.2.0] - 2026-09-24
 
 ### 新增
