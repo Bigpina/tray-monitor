@@ -24,7 +24,7 @@ from usage_client import UsageError, format_status, query_usage_candidates, summ
 # ---------------------------------------------------------------------------
 # 版本号
 # ---------------------------------------------------------------------------
-__version__ = "4.3.1"
+__version__ = "4.3.2"
 
 import psutil
 import pystray
@@ -673,8 +673,9 @@ class SettingsWindow:
     FONT_MONO = ("Consolas", 9)
     FONT_GROUP = ("Microsoft YaHei UI", 8, "bold")
 
-    def __init__(self, on_save_callback=None):
+    def __init__(self, on_save_callback=None, monitor=None):
         self.on_save_callback = on_save_callback
+        self.monitor = monitor
         self.win = None
 
     def show(self):
@@ -692,6 +693,18 @@ class SettingsWindow:
             self._build_window()
         run_on_ui(_open)
 
+    def _usage_display_text(self) -> str:
+        """当前用量一行文本（设置窗状态区显示用）。"""
+        m = self.monitor
+        if m is None:
+            return "用量: 未连接"
+        line = m._usage_line or "用量: 查询中..."
+        if m._usage_ok and m._usage_source:
+            line += f"  [{m._usage_source}]"
+        if m._usage_updated_at:
+            line += f"  · 更新 {m._usage_updated_at}"
+        return line
+
     def _build_window(self):
         import tkinter as tk
         from tkinter import ttk
@@ -703,7 +716,7 @@ class SettingsWindow:
 
         self.win = tk.Toplevel(root)
         self.win.title(f"设置 · 托盘监控 v{__version__}")
-        self.win.geometry("560x770")
+        self.win.geometry("560x800")
         self.win.minsize(520, 560)
         self.win.configure(bg="#F3F3F3")
 
@@ -779,16 +792,21 @@ class SettingsWindow:
         for _c in (0, 1):
             g_usage.columnconfigure(_c, weight=1)
 
+        # 当前用量（来自托盘运行状态，每 5 秒刷新）
+        self._usage_var = tk.StringVar(value=self._usage_display_text())
+        ttk.Label(g_usage, textvariable=self._usage_var, font=self.FONT_UI).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
         ttk.Label(g_usage,
                   text="Cookie 文件（浏览器 F12 → Network → usage 请求 → 复制 Cookie 值存为文件）",
                   font=self.FONT_UI, foreground=self.CLR_MUTED).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            row=1, column=0, columnspan=3, sticky="w", pady=(0, 4))
         var_usage_file = tk.StringVar(value=cfg.get("usage_cookie_file", ""))
         ttk.Entry(g_usage, textvariable=var_usage_file, font=self.FONT_MONO).grid(
-            row=1, column=0, columnspan=2, sticky="ew", padx=(0, 6))
+            row=2, column=0, columnspan=2, sticky="ew", padx=(0, 6))
         ttk.Button(g_usage, text="浏览", width=6,
                    command=lambda: self._browse_usage_file(var_usage_file)).grid(
-            row=1, column=2, sticky="e")
+            row=2, column=2, sticky="e")
 
         var_usage_interval = tk.StringVar(value=str(cfg.get("usage_interval", 600)))
         var_usage_alert = tk.StringVar(value=str(cfg.get("usage_alert_percent", 90)))
@@ -797,7 +815,7 @@ class SettingsWindow:
             ("超额提醒阈值（%, 0=关）", var_usage_alert),
         ]):
             cell = ttk.Frame(g_usage)
-            cell.grid(row=2, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(8, 0))
+            cell.grid(row=3, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(8, 0))
             ttk.Label(cell, text=label, font=self.FONT_UI,
                       foreground=self.CLR_MUTED).pack(anchor="w", pady=(0, 4))
             ttk.Entry(cell, textvariable=var, font=self.FONT_UI).pack(fill="x")
@@ -878,6 +896,17 @@ class SettingsWindow:
                        var_st, var_oc, var_node, var_mjs,
                        var_interval, var_maxfail, var_cooldown, var_loglevel,
                        var_usage_file, var_usage_interval, var_usage_alert)).pack(side="left")
+
+        # 用量动态刷新：窗口存活期间每 5 秒同步一次托盘运行状态
+        usage_win = self.win
+
+        def _refresh_usage():
+            if self.win is not usage_win or not usage_win.winfo_exists():
+                return
+            self._usage_var.set(self._usage_display_text())
+            usage_win.after(5000, _refresh_usage)
+
+        usage_win.after(5000, _refresh_usage)
 
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
         self.win.focus_force()
@@ -1427,8 +1456,10 @@ class TrayMonitor:
         self._usage_alerted = False
         self._usage_data: dict | None = None
         self._usage_source = ""
+        self._usage_updated_at = ""            # 上次成功查询时间 HH:MM:SS
         self._usage_wake = threading.Event()   # 扩展推送新 Cookie 时唤醒用量线程
         self._usage_sync_server: HTTPServer | None = None
+        self._last_left_click = 0.0            # 左键双击判定时间戳
 
     # --- 图标更新 ---
 
@@ -1541,6 +1572,7 @@ class TrayMonitor:
             self._usage_last_err = None
             self._usage_data = s
             self._usage_line = new_line
+            self._usage_updated_at = time.strftime("%H:%M:%S")
 
             # 超额提醒：跨过阈值触发一次，降回阈值内后允许再次触发
             threshold = float(CONFIG.get("usage_alert_percent", 0) or 0)
@@ -1641,15 +1673,21 @@ class TrayMonitor:
 
     # --- 菜单 ---
 
-    def _menu_status(self, icon, item):
-        """显示当前状态。"""
-        log.info("状态: %s", self._status_text)
+    def _on_left_click(self, icon, item):
+        """左键双击打开设置。pystray 在 Windows 只回调 WM_LBUTTONUP（无双击事件），
+        500ms 内第二次抬起视为双击，单击不动作。"""
+        now = time.monotonic()
+        if now - self._last_left_click <= 0.5:
+            self._last_left_click = 0.0
+            self._menu_settings(icon, item)
+        else:
+            self._last_left_click = now
 
     def _menu_settings(self, icon, item):
         """打开设置窗口。"""
         try:
             if self._settings_window is None:
-                self._settings_window = SettingsWindow()
+                self._settings_window = SettingsWindow(monitor=self)
             self._settings_window.show()
         except Exception:
             log.exception("打开设置窗失败")
@@ -1690,9 +1728,10 @@ class TrayMonitor:
             self.icon.stop()
 
     def _build_menu(self):
+        # 菜单只放操作项（状态/用量已移除：见悬停提示与设置窗）；
+        # 不可见默认项承接左键 WM_LBUTTONUP → 双击判定开设置
         return pystray.Menu(
-            pystray.MenuItem(lambda item: self._status_text, self._menu_status, default=True),
-            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("", self._on_left_click, default=True, visible=False),
             pystray.MenuItem(lambda item: "恢复监控" if self.state.paused else "暂停监控",
                              self._menu_toggle_pause),
             pystray.MenuItem("设置", self._menu_settings),
