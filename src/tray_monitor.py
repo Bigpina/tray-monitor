@@ -24,7 +24,7 @@ from usage_client import UsageError, format_status, query_usage, summarize
 # ---------------------------------------------------------------------------
 # 版本号
 # ---------------------------------------------------------------------------
-__version__ = "4.3.3"
+__version__ = "4.3.4"
 
 import psutil
 import pystray
@@ -212,24 +212,28 @@ _icon_lock = threading.Lock()
 
 
 def get_ui_root():
-    """返回进程内唯一的隐藏 Tk 根（UI 线程上运行 mainloop）。"""
+    """返回进程内唯一的隐藏 Tk 根（UI 线程上运行 mainloop）。
+
+    线程安全约束（2026-09-26 死锁修复）：锁内绝不做任何 Tk 调用。
+    tkinter 跨线程调用（如 winfo_exists）会阻塞等待 UI 线程服务，
+    而 UI 线程打开设置窗时也要来取这把锁——双方互等形成 AB-BA 死锁，
+    表现为左键双击无反应、右键菜单随后失效（py-spy 两次复现确认）。
+    根的存活改由 UI 线程退出 mainloop 时在 finally 里清理，本函数
+    只读 Python 引用，不碰 Tk。
+    """
     global _ui_root
     with _ui_root_lock:
         if _ui_root is not None:
-            try:
-                if _ui_root.winfo_exists():
-                    return _ui_root
-            except Exception:
-                pass
-            _ui_root = None
-            _ui_root_ready.clear()
+            return _ui_root
 
         def _ui_main():
             global _ui_root
+            created = None
             try:
                 import tkinter as tk
                 root = tk.Tk()
                 root.withdraw()
+                created = root
                 _ui_root = root
                 _ui_root_ready.set()
                 log.info("UI 线程 Tk 根已启动")
@@ -237,7 +241,14 @@ def get_ui_root():
             except Exception:
                 log.exception("UI 线程崩溃")
                 _ui_root_ready.set()
+            finally:
+                # 只清理本线程创建的根：若退出时 _ui_root 已是新线程
+                # 的新根（启动竞态），不能误清
+                with _ui_root_lock:
+                    if _ui_root is created:
+                        _ui_root = None
 
+        _ui_root_ready.clear()
         threading.Thread(target=_ui_main, daemon=True, name="tray-ui").start()
         if not _ui_root_ready.wait(timeout=8):
             log.error("UI 线程启动超时")

@@ -2,6 +2,11 @@
 
 所有版本的变更说明。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [4.3.4] - 2026-09-26
+
+### 修复
+- **托盘 UI 死锁（左键双击无反应、右键菜单随后失效）**：`get_ui_root()` 原先在持有 `_ui_root_lock` 期间调用跨线程 Tk API `winfo_exists()`——该调用会阻塞等待 UI 线程服务 Tcl 事件；而 UI 线程打开设置窗时（`_build_window → get_ui_root`）也要来取同一把锁，双方互等形成 AB-BA 死锁，pystray 消息循环与 Tk 主循环同时冻结（py-spy 两次现场栈确认）。现改为锁内只读 Python 引用、不做任何 Tk 调用；根的存活改由 UI 线程退出 mainloop 时在 `finally` 中清理（带创建者身份校验，避免启动竞态误清新根）
+
 ## [4.3.3] - 2026-09-24
 
 ### 变更
